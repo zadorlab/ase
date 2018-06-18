@@ -263,6 +263,9 @@ class Gaussian(FileIOCalculator):
                 if 'change' in self.parameters: #coordinates that first need to be updated and then frozen
                     for c in self.parameters['change']:
                         inputfile.write('%s F\n'%' '.join(map(str,c)))
+                if 'relaxed_scan' in self.parameters: #coordinates that first need to be scanned
+                    for s in self.parameters['relaxed_scan']:
+                        inputfile.write('%s S %i %.2f\n'%(' '.join(map(str,s[:-2])),s[-2],s[-1]))
 
         if 'gen' in self.parameters['basis'].lower():
             if self.basisfile is None:
