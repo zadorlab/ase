@@ -150,6 +150,8 @@ def read_gaussian_out(filename, index=-1, quantity='atoms'):
                                     float(lines[n + j + 3].split()[3]),
                                     float(lines[n + j + 3].split()[4])]]
                     iforces.append(np.array(forces))
+                if ('SCF Done' in line):
+                    energy = float(line.split()[4])
             convert = ase.units.Hartree / ase.units.Bohr
             forces = np.array(iforces) * convert
         except:
