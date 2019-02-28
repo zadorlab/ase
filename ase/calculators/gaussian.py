@@ -330,7 +330,7 @@ class Gaussian(FileIOCalculator):
 
     def get_potential_energy(self, atoms):
         """
-        Calcualte and return potential energy
+        Calculate and return potential energy
         Update the geometry of the atoms
         """
         self.calculate(atoms)
