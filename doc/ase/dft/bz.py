@@ -1,108 +1,43 @@
-# creates: cubic.svg, fcc.svg, bcc.svg, tetragonal.svg, orthorhombic.svg
-# creates: hexagonal.svg, monoclinic.svg
-from math import pi, sin, cos
+# creates: bztable.rst
+# creates: 00.CUB.svg 01.FCC.svg 02.BCC.svg 03.TET.svg 04.BCT1.svg
+# creates: 05.BCT2.svg 06.ORC.svg 07.ORCF1.svg 08.ORCF2.svg 09.ORCF3.svg
+# creates: 10.ORCI.svg 11.ORCC.svg 12.HEX.svg 13.RHL1.svg 14.RHL2.svg
+# creates: 15.MCL.svg 16.MCLC1.svg 17.MCLC3.svg 18.MCLC5.svg 19.TRI1a.svg
+# creates: 20.TRI1b.svg 21.TRI2a.svg 22.TRI2b.svg
+# creates: 23.OBL.svg 24.RECT.svg 25.CRECT.svg 26.HEX2D.svg 27.SQR.svg
 
-import numpy as np
-import matplotlib.pyplot as plt
-
-from ase.dft.kpoints import (get_special_points, special_paths,
-                             parse_path_string)
-
-
-def bz_vertices(cell):
-    from scipy.spatial import Voronoi
-    icell = np.linalg.inv(cell)
-    I = np.indices((3, 3, 3)).reshape((3, 27)) - 1
-    G = np.dot(icell, I).T
-    vor = Voronoi(G)
-    bz1 = []
-    for vertices, points in zip(vor.ridge_vertices, vor.ridge_points):
-        if -1 not in vertices and 13 in points:
-            normal = G[points].sum(0)
-            normal /= (normal**2).sum()**0.5
-            bz1.append((vor.vertices[vertices], normal))
-    return bz1
+from ase.lattice import all_variants
 
 
-def plot(cell, paths, elev=None, scale=1):
-    import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
-    Axes3D  # silence pyflakes
+header = """\
 
-    fig = plt.figure(figsize=(5, 5))
-    ax = fig.gca(projection='3d')
+Brillouin zone data
+-------------------
 
-    azim = pi / 5
-    elev = elev or pi / 6
-    x = sin(azim)
-    y = cos(azim)
-    view = [x * cos(elev), y * cos(elev), sin(elev)]
-
-    bz1 = bz_vertices(cell)
-
-    for points, normal in bz1:
-        if np.dot(normal, view) < 0:
-            ls = ':'
-        else:
-            ls = '-'
-        x, y, z = np.concatenate([points, points[:1]]).T
-        ax.plot(x, y, z, c='k', ls=ls)
-
-    txt = ''
-    for names, points in paths:
-        x, y, z = np.array(points).T
-        ax.plot(x, y, z, c='b', ls='-')
-
-        for name, point in zip(names, points):
-            x, y, z = point
-            if name == 'G':
-                name = '\\Gamma'
-            elif len(name) > 1:
-                name = name[0] + '_' + name[1]
-            ax.text(x, y, z, '$' + name + '$',
-                    ha='center', va='bottom', color='r')
-            txt += '`' + name + '`-'
-
-        txt = txt[:-1] + '|'
-
-    print(txt[:-1])
-
-    ax.set_axis_off()
-    ax.autoscale_view(tight=True)
-    s = np.array(paths[0][1]).max() / 0.5 * 0.45 * scale
-    ax.set_xlim(-s, s)
-    ax.set_ylim(-s, s)
-    ax.set_zlim(-s, s)
-    ax.set_aspect('equal')
-
-    ax.view_init(azim=azim / pi * 180, elev=elev / pi * 180)
+.. list-table::
+    :widths: 10 15 45
+"""
 
 
-for X, cell in [
-    ('cubic', np.eye(3)),
-    ('fcc', [[0, 1, 1], [1, 0, 1], [1, 1, 0]]),
-    ('bcc', [[-1, 1, 1], [1, -1, 1], [1, 1, -1]]),
-    ('tetragonal', [[1, 0, 0], [0, 1, 0], [0, 0, 1.3]]),
-    ('orthorhombic', [[1, 0, 0], [0, 1.2, 0], [0, 0, 1.4]]),
-    ('hexagonal', [[1, 0, 0], [-0.5, 3**0.5 / 2, 0], [0, 0, 1]]),
-    ('monoclinic', [[1, 0, 0], [0, 1, 0], [0, 0.2, 1]])]:
+entry = """\
+    * - {name} ({longname})
+      - {bandpath}
+      - .. image:: {fname}
+            :width: 40 %
+"""
 
-    icell = np.linalg.inv(cell)
-    print(cell, X)
-    special_points = get_special_points(cell, X)
-    paths = []
-    for names in parse_path_string(special_paths[X]):
-        points = []
-        for name in names:
-            points.append(np.dot(icell, special_points[name]))
-        paths.append((names, points))
+with open('bztable.rst', 'w') as fd:
+    print(header, file=fd)
 
-    if X == 'bcc':
-        scale = 0.6
-        elev = pi / 13
-    else:
-        scale = 1
-        elev = None
-
-    plot(cell, paths, elev, scale)
-    plt.savefig(X + '.svg')
+    for i, lat in enumerate(all_variants()):
+        id = '{:02d}.{}'.format(i, lat.variant)
+        imagefname = '{}.svg'.format(id)
+        txt = entry.format(name=lat.variant,
+                           longname=lat.longname,
+                           bandpath=lat.bandpath().path,
+                           fname=imagefname)
+        print(txt, file=fd)
+        ax = lat.plot_bz()
+        fig = ax.get_figure()
+        fig.savefig(imagefname, bbox_inches='tight')
+        fig.clear()

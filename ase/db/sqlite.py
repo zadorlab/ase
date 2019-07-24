@@ -15,16 +15,17 @@ Versions:
 
 from __future__ import absolute_import, print_function
 import json
+import numbers
 import os
 import sqlite3
 import sys
 
 import numpy as np
 
+import ase.io.jsonio
 from ase.data import atomic_numbers
 from ase.db.row import AtomsRow
 from ase.db.core import Database, ops, now, lock, invop, parse_selection
-from ase.io.jsonio import encode, decode
 from ase.parallel import parallel_function
 from ase.utils import basestring
 
@@ -96,7 +97,8 @@ init_statements = [
     name TEXT,
     value TEXT)""",
 
-    "INSERT INTO information VALUES ('version', '{}')".format(VERSION)]
+    "INSERT INTO information VALUES ('version', '{}')".format(VERSION),
+    ]
 
 index_statements = [
     'CREATE INDEX unique_id_index ON systems(unique_id)',
@@ -119,6 +121,7 @@ def float_if_not_none(x):
 
 
 class SQLite3Database(Database, object):
+    type = 'db'
     initialized = False
     _allow_reading_old_format = False
     default = 'NULL'  # used for autoincrement id
@@ -126,6 +129,41 @@ class SQLite3Database(Database, object):
     version = None
     columnnames = [line.split()[0].lstrip()
                    for line in init_statements[0].splitlines()[1:]]
+
+    def encode(self, obj):
+        return ase.io.jsonio.encode(obj)
+
+    def decode(self, txt):
+        return ase.io.jsonio.decode(txt)
+
+    def blob(self, array):
+        """Convert array to blob/buffer object."""
+
+        if array is None:
+            return None
+        if len(array) == 0:
+            array = np.zeros(0)
+        if array.dtype == np.int64:
+            array = array.astype(np.int32)
+        if not np.little_endian:
+            array = array.byteswap()
+        return buffer(np.ascontiguousarray(array))
+
+    def deblob(self, buf, dtype=float, shape=None):
+        """Convert blob/buffer object to ndarray of correct dtype and shape.
+
+        (without creating an extra view)."""
+        if buf is None:
+            return None
+        if len(buf) == 0:
+            array = np.zeros(0, dtype)
+        else:
+            array = np.frombuffer(buf, dtype)
+            if not np.little_endian:
+                array = array.byteswap()
+        if shape is not None:
+            array.shape = shape
+        return array
 
     def _connect(self):
         return sqlite3.connect(self.filename, timeout=600)
@@ -191,29 +229,42 @@ class SQLite3Database(Database, object):
 
         self.initialized = True
 
-    def _write(self, atoms, key_value_pairs, data):
+    def _write(self, atoms, key_value_pairs, data, id):
+        ext_tables = key_value_pairs.pop("external_tables", {})
         Database._write(self, atoms, key_value_pairs, data)
+        encode = self.encode
 
         con = self.connection or self._connect()
         self._initialize(con)
         cur = con.cursor()
 
-        id = None
+        mtime = now()
+
+        blob = self.blob
+
+        text_key_values = []
+        number_key_values = []
 
         if not isinstance(atoms, AtomsRow):
             row = AtomsRow(atoms)
-            row.ctime = mtime = now()
+            row.ctime = mtime
             row.user = os.getenv('USER')
         else:
             row = atoms
-            cur.execute('SELECT id FROM systems WHERE unique_id=?',
-                        (row.unique_id,))
-            results = cur.fetchall()
-            if results:
-                id = results[0][0]
-                self._delete(cur, [id], ['keys', 'text_key_values',
-                                         'number_key_values'])
-            mtime = now()
+
+            # Extract the external tables from AtomsRow
+            names = self._get_external_table_names(db_con=con)
+            for name in names:
+                new_table = row.get(name, {})
+                if new_table:
+                    ext_tables[name] = new_table
+
+        if id:
+            self._delete(cur, [id], ['keys', 'text_key_values',
+                                     'number_key_values', 'species'])
+        else:
+            if not key_value_pairs:
+                key_value_pairs = row.key_value_pairs
 
         constraints = row._constraints
         if constraints:
@@ -242,9 +293,6 @@ class SQLite3Database(Database, object):
         else:
             values += (None, None)
 
-        if key_value_pairs is None:
-            key_value_pairs = row.key_value_pairs
-
         if not data:
             data = row._data
         if not isinstance(data, basestring):
@@ -271,25 +319,23 @@ class SQLite3Database(Database, object):
             q = self.default + ', ' + ', '.join('?' * len(values))
             cur.execute('INSERT INTO systems VALUES ({})'.format(q),
                         values)
+            id = self.get_last_id(cur)
         else:
             q = ', '.join(name + '=?' for name in self.columnnames[1:])
             cur.execute('UPDATE systems SET {} WHERE id=?'.format(q),
                         values + (id,))
 
-        if id is None:
-            id = self.get_last_id(cur)
-
-            count = row.count_atoms()
-            if count:
-                species = [(atomic_numbers[symbol], n, id)
-                           for symbol, n in count.items()]
-                cur.executemany('INSERT INTO species VALUES (?, ?, ?)',
-                                species)
+        count = row.count_atoms()
+        if count:
+            species = [(atomic_numbers[symbol], n, id)
+                       for symbol, n in count.items()]
+            cur.executemany('INSERT INTO species VALUES (?, ?, ?)',
+                            species)
 
         text_key_values = []
         number_key_values = []
         for key, value in key_value_pairs.items():
-            if isinstance(value, (float, int, np.bool_)):
+            if isinstance(value, (numbers.Real, np.bool_)):
                 number_key_values.append([key, float(value), id])
             else:
                 assert isinstance(value, basestring)
@@ -302,6 +348,91 @@ class SQLite3Database(Database, object):
         cur.executemany('INSERT INTO keys VALUES (?, ?)',
                         [(key, id) for key in key_value_pairs])
 
+        # Update external tables
+        valid_entries = []
+        for k, v in ext_tables.items():
+            try:
+                # Guess the type of the value
+                dtype = self._guess_type(v)
+                self._create_table_if_not_exists(k, dtype, db_con=con)
+                v["id"] = id
+                valid_entries.append(k)
+            except ValueError as exc:
+                # Close the connection without committing
+                if self.connection is None:
+                    con.close()
+                # Raise error again
+                raise ValueError(exc)
+
+        # Insert entries in the valid tables
+        for tabname in valid_entries:
+            try:
+                self._insert_in_external_table(
+                    cur, name=tabname, entries=ext_tables[tabname])
+            except ValueError as exc:
+                # Close the connection without committing
+                if self.connection is None:
+                    con.close()
+                # Raise the error again
+                raise ValueError(exc)
+
+        if self.connection is None:
+            con.commit()
+            con.close()
+
+        return id
+
+    def _update(self, id, key_value_pairs, data=None):
+        """Update key_value_pairs and data for a single row """
+        encode = self.encode
+        ext_tab = key_value_pairs.pop('external_tables', {})
+
+        con = self.connection or self._connect()
+        self._initialize(con)
+        cur = con.cursor()
+
+        mtime = now()
+
+        cur.execute(
+            "UPDATE systems SET mtime={}, key_value_pairs='{}' WHERE id={}"
+            .format(mtime, encode(key_value_pairs), id))
+        if data:
+            cur.execute("UPDATE systems set data='{}' where id={}"
+                        .format(encode(data), id))
+
+        self._delete(cur, [id], ['keys', 'text_key_values',
+                                 'number_key_values'])
+
+        text_key_values = []
+        number_key_values = []
+        for key, value in key_value_pairs.items():
+            if isinstance(value, (numbers.Real, np.bool_)):
+                number_key_values.append([key, float(value), id])
+            else:
+                assert isinstance(value, basestring)
+                text_key_values.append([key, value, id])
+
+        cur.executemany('INSERT INTO text_key_values VALUES (?, ?, ?)',
+                        text_key_values)
+        cur.executemany('INSERT INTO number_key_values VALUES (?, ?, ?)',
+                        number_key_values)
+        cur.executemany('INSERT INTO keys VALUES (?, ?)',
+                        [(key, id) for key in key_value_pairs])
+
+        for tabname, values in ext_tab.items():
+            values['id'] = id
+            try:
+                dtype = self._guess_type(values)
+                self._create_table_if_not_exists(tabname, dtype, db_con=con)
+                self._insert_in_external_table(
+                    cur, name=tabname, entries=values)
+            except ValueError as exc:
+                # Close the connection without committing
+                if self.connection is None:
+                    con.close()
+                # Raise the error again
+                raise ValueError(exc)
+
         if self.connection is None:
             con.commit()
             con.close()
@@ -310,8 +441,12 @@ class SQLite3Database(Database, object):
 
     def get_last_id(self, cur):
         cur.execute('SELECT seq FROM sqlite_sequence WHERE name="systems"')
-        id = cur.fetchone()[0]
-        return id
+        result = cur.fetchone()
+        if result is not None:
+            id = result[0]
+            return id
+        else:
+            return 0
 
     def _get_row(self, id):
         con = self._connect()
@@ -329,6 +464,9 @@ class SQLite3Database(Database, object):
         return self._convert_tuple_to_row(values)
 
     def _convert_tuple_to_row(self, values):
+        deblob = self.deblob
+        decode = self.decode
+
         values = self._old2new(values)
         dct = {'id': values[0],
                'unique_id': values[1],
@@ -337,8 +475,10 @@ class SQLite3Database(Database, object):
                'user': values[4],
                'numbers': deblob(values[5], np.int32),
                'positions': deblob(values[6], shape=(-1, 3)),
-               'cell': deblob(values[7], shape=(3, 3)),
-               'pbc': (values[8] & np.array([1, 2, 4])).astype(bool)}
+               'cell': deblob(values[7], shape=(3, 3))}
+
+        if values[8] is not None:
+            dct['pbc'] = (values[8] & np.array([1, 2, 4])).astype(bool)
         if values[9] is not None:
             dct['initial_magmoms'] = deblob(values[9])
         if values[10] is not None:
@@ -353,6 +493,7 @@ class SQLite3Database(Database, object):
             dct['constraints'] = values[14]
         if values[15] is not None:
             dct['calculator'] = values[15]
+        if values[16] is not None:
             dct['calculator_parameters'] = decode(values[16])
         if values[17] is not None:
             dct['energy'] = values[17]
@@ -373,18 +514,28 @@ class SQLite3Database(Database, object):
         if values[25] != '{}':
             dct['key_value_pairs'] = decode(values[25])
         if len(values) >= 27 and values[26] != 'null':
-            dct['data'] = values[26]
+            dct['data'] = decode(values[26])
 
+        # Now we need to update with info from the external tables
+        external_tab = self._get_external_table_names()
+        tables = {}
+        for tab in external_tab:
+            row = self._read_external_table(tab, dct["id"])
+            tables[tab] = row
+
+        dct.update(tables)
         return AtomsRow(dct)
 
     def _old2new(self, values):
+        if self.type == 'postgresql':
+            assert self.version >= 8, 'Your db-version is too old!'
         assert self.version >= 4, 'Your db-file is too old!'
         if self.version < 5:
             pass  # should be ok for reading by convert.py script
         if self.version < 6:
             m = values[23]
             if m is not None and not isinstance(m, float):
-                magmom = float(deblob(m, shape=()))
+                magmom = float(self.deblob(m, shape=()))
                 values = values[:23] + (magmom,) + values[24:]
         return values
 
@@ -394,19 +545,21 @@ class SQLite3Database(Database, object):
         tables = ['systems']
         where = []
         args = []
-
-        for n, key in enumerate(keys):
+        for key in keys:
             if key == 'forces':
                 where.append('systems.fmax IS NOT NULL')
             elif key == 'strain':
                 where.append('systems.smax IS NOT NULL')
             elif key in ['energy', 'fmax', 'smax',
                          'constraints', 'calculator']:
-                where.append('systems.{0} IS NOT NULL'.format(key))
+                where.append('systems.{} IS NOT NULL'.format(key))
             else:
-                tables.append('keys AS keys{0}'.format(n))
-                where.append('systems.id=keys{0}.id AND keys{0}.key=?'
-                             .format(n))
+                if '-' not in key:
+                    q = 'systems.id in (select id from keys where key=?)'
+                else:
+                    key = key.replace('-', '')
+                    q = 'systems.id not in (select id from keys where key=?)'
+                where.append(q)
                 args.append(key)
 
         # Special handling of "H=0" and "H<2" type of selections:
@@ -415,10 +568,6 @@ class SQLite3Database(Database, object):
             if isinstance(key, int):
                 bad[key] = bad.get(key, True) and ops[op](0, value)
 
-        found_sort_table = False
-        nspecies = 0
-        ntext = 0
-        nnumber = 0
         for key, op, value in cmps:
             if key in ['id', 'energy', 'magmom', 'ctime', 'user',
                        'calculator', 'natoms', 'pbc', 'unique_id',
@@ -429,69 +578,83 @@ class SQLite3Database(Database, object):
                     assert op in ['=', '!=']
                     value = int(np.dot([x == 'T' for x in value], [1, 2, 4]))
                 elif key == 'magmom':
-                    assert self.version >= 6, 'Update you db-file'
-                where.append('systems.{0}{1}?'.format(key, op))
+                    assert self.version >= 6, 'Update your db-file'
+                where.append('systems.{}{}?'.format(key, op))
                 args.append(value)
             elif isinstance(key, int):
-                if bad[key]:
+                if self.type == 'postgresql':
                     where.append(
-                        'NOT EXISTS (SELECT id FROM species WHERE\n' +
-                        '  species.id=systems.id AND species.Z=? AND ' +
-                        'species.n{0}?)'.format(invop[op]))
+                        'cardinality(array_positions(' +
+                        'numbers::int[], ?)){}?'.format(op))
                     args += [key, value]
                 else:
-                    tables.append('species AS specie{0}'.format(nspecies))
-                    where.append(('systems.id=specie{0}.id AND ' +
-                                  'specie{0}.Z=? AND ' +
-                                  'specie{0}.n{1}?').format(nspecies, op))
-                    args += [key, value]
-                    nspecies += 1
+                    if bad[key]:
+                        where.append(
+                            'systems.id not in (select id from species ' +
+                            'where Z=? and n{}?)'.format(invop[op]))
+                        args += [key, value]
+                    else:
+                        where.append('systems.id in (select id from species ' +
+                                     'where Z=? and n{}?)'.format(op))
+                        args += [key, value]
+
+            elif self.type == 'postgresql':
+                jsonop = '->'
+                if isinstance(value, basestring):
+                    jsonop = '->>'
+                elif isinstance(value, bool):
+                    jsonop = '->>'
+                    value = str(value).lower()
+                where.append("systems.key_value_pairs {} '{}'{}?"
+                             .format(jsonop, key, op))
+                args.append(str(value))
+
             elif isinstance(value, basestring):
-                tables.append('text_key_values AS text{0}'.format(ntext))
-                where.append(('systems.id=text{0}.id AND ' +
-                              'text{0}.key=? AND ' +
-                              'text{0}.value{1}?').format(ntext, op))
+                where.append('systems.id in (select id from text_key_values ' +
+                             'where key=? and value{}?)'.format(op))
                 args += [key, value]
-                if sort_table == 'text_key_values' and sort == key:
-                    sort_table = 'text{0}'.format(ntext)
-                    found_sort_table = True
-                ntext += 1
             else:
-                tables.append('number_key_values AS number{0}'.format(nnumber))
-                where.append(('systems.id=number{0}.id AND ' +
-                              'number{0}.key=? AND ' +
-                              'number{0}.value{1}?').format(nnumber, op))
+                where.append(
+                    'systems.id in (select id from number_key_values ' +
+                    'where key=? and value{}?)'.format(op))
                 args += [key, float(value)]
-                if sort_table == 'number_key_values' and sort == key:
-                    sort_table = 'number{0}'.format(nnumber)
-                    found_sort_table = True
-                nnumber += 1
 
         if sort:
-            if sort_table == 'systems':
-                if sort in ['energy', 'fmax', 'smax', 'calculator']:
-                    where.append('systems.{0} IS NOT NULL'.format(sort))
-            else:
-                if not found_sort_table:
-                    tables.append('{0} AS sort_table'.format(sort_table))
-                    where.append('systems.id=sort_table.id AND '
-                                 'sort_table.key=?')
-                    args.append(sort)
-                    sort_table = 'sort_table'
+            if sort_table != 'systems':
+                tables.append('{} AS sort_table'.format(sort_table))
+                where.append('systems.id=sort_table.id AND '
+                             'sort_table.key=?')
+                args.append(sort)
+                sort_table = 'sort_table'
                 sort = 'value'
 
-        sql = 'SELECT {0} FROM\n  '.format(what) + ', '.join(tables)
+        sql = 'SELECT {} FROM\n  '.format(what) + ', '.join(tables)
         if where:
             sql += '\n  WHERE\n  ' + ' AND\n  '.join(where)
         if sort:
-            sql += '\nORDER BY {0}.{1} {2}'.format(sort_table, sort, order)
+            # XXX use "?" instead of "{}"
+            sql += '\nORDER BY {0}.{1} IS NULL, {0}.{1} {2}'.format(
+                sort_table, sort, order)
 
         return sql, args
 
     def _select(self, keys, cmps, explain=False, verbosity=0,
-                limit=None, offset=0, sort=None, include_data=True):
+                limit=None, offset=0, sort=None, include_data=True,
+                columns='all'):
         con = self._connect()
         self._initialize(con)
+
+        values = np.array([None for i in range(27)])
+        values[25] = '{}'
+        values[26] = 'null'
+
+        if columns == 'all':
+            columnindex = list(range(26))
+        else:
+            columnindex = [c for c in range(0, 26)
+                           if self.columnnames[c] in columns]
+        if include_data:
+            columnindex.append(26)
 
         if sort:
             if sort[0] == '-':
@@ -504,27 +667,28 @@ class SQLite3Database(Database, object):
                         'fmax', 'smax', 'volume', 'mass', 'charge', 'natoms']:
                 sort_table = 'systems'
             else:
-                for dct in self._select(keys + [sort], cmps, limit=1,
-                                        include_data=False):
+                for dct in self._select(keys + [sort], cmps=[], limit=1,
+                                        include_data=False,
+                                        columns=['key_value_pairs']):
                     if isinstance(dct['key_value_pairs'][sort], basestring):
                         sort_table = 'text_key_values'
                     else:
                         sort_table = 'number_key_values'
                     break
                 else:
-                    return
+                    # No rows.  Just pick a table:
+                    sort_table = 'number_key_values'
+
         else:
             order = None
             sort_table = None
 
-        if include_data:
-            what = 'systems.*'
-        else:
-            what = ', '.join('systems.' + name
-                             for name in self.columnnames[:26])
+        what = ', '.join('systems.' + name
+                         for name in
+                         np.array(self.columnnames)[np.array(columnindex)])
 
-        sql, args = self.create_select_statement(keys, cmps,
-                                                 sort, order, sort_table, what)
+        sql, args = self.create_select_statement(keys, cmps, sort, order,
+                                                 sort_table, what)
 
         if explain:
             sql = 'EXPLAIN QUERY PLAN ' + sql
@@ -544,8 +708,23 @@ class SQLite3Database(Database, object):
             for row in cur.fetchall():
                 yield {'explain': row}
         else:
-            for values in cur.fetchall():
-                yield self._convert_tuple_to_row(values)
+            n = 0
+            for shortvalues in cur.fetchall():
+                values[columnindex] = shortvalues
+                yield self._convert_tuple_to_row(tuple(values))
+                n += 1
+
+            if sort and sort_table != 'systems':
+                # Yield rows without sort key last:
+                if limit is not None:
+                    if n == limit:
+                        return
+                    limit -= n
+                for row in self._select(keys + ['-' + sort], cmps,
+                                        limit=limit, offset=offset,
+                                        include_data=include_data,
+                                        columns=columns):
+                    yield row
 
     @parallel_function
     def count(self, selection=None, **kwargs):
@@ -562,47 +741,14 @@ class SQLite3Database(Database, object):
         self._initialize(con)
         con.execute('ANALYZE')
 
-    def _update(self, ids, delete_keys, add_key_value_pairs):
-        """Update row(s).
-
-        ids: int or list of int
-            ID's of rows to update.
-        delete_keys: list of str
-            Keys to remove.
-        add_key_value_pairs: dict
-            Key-value pairs to add.
-
-        Returns number of key-value pairs added and keys removed.
-        """
-
-        rows = [self._get_row(id) for id in ids]
-        if self.connection:
-            # We are already running inside a context manager:
-            return self._update_rows(rows, delete_keys, add_key_value_pairs)
-
-        # Create new context manager:
-        with self:
-            return self._update_rows(rows, delete_keys, add_key_value_pairs)
-
-    def _update_rows(self, rows, delete_keys, add_key_value_pairs):
-        m = 0
-        n = 0
-        for row in rows:
-            kvp = row.key_value_pairs
-            n += len(kvp)
-            for key in delete_keys:
-                kvp.pop(key, None)
-            n -= len(kvp)
-            m -= len(kvp)
-            kvp.update(add_key_value_pairs)
-            m += len(kvp)
-            self._write(row, kvp, None)
-        return m, n
-
     @parallel_function
     @lock
     def delete(self, ids):
+        if len(ids) == 0:
+            return
         con = self._connect()
+        self._delete(con.cursor(), ids,
+                     tables=self._get_external_table_names(db_con=con))
         self._delete(con.cursor(), ids)
         con.commit()
         con.close()
@@ -610,8 +756,8 @@ class SQLite3Database(Database, object):
     def _delete(self, cur, ids, tables=None):
         tables = tables or all_tables[::-1]
         for table in tables:
-            cur.executemany('DELETE FROM {0} WHERE id=?'.format(table),
-                            ((id,) for id in ids))
+            cur.execute('DELETE FROM {} WHERE id in ({});'.
+                        format(table, ', '.join([str(id) for id in ids])))
 
     @property
     def metadata(self):
@@ -637,42 +783,155 @@ class SQLite3Database(Database, object):
                         ('metadata', md))
         con.commit()
 
+    def _get_external_table_names(self, db_con=None):
+        """Return a list with the external table names."""
+        con = db_con or self.connection or self._connect()
+        cur = con.cursor()
+        sql = "SELECT value FROM information WHERE name='external_table_name'"
+        cur.execute(sql)
+        ext_tab_names = [x[0] for x in cur.fetchall()]
 
-def blob(array):
-    """Convert array to blob/buffer object."""
+        if self.connection is None and db_con is None:
+            con.close()
+        return ext_tab_names
 
-    if array is None:
-        return None
-    if len(array) == 0:
-        array = np.zeros(0)
-    if array.dtype == np.int64:
-        array = array.astype(np.int32)
-    if not np.little_endian:
-        array.byteswap(True)
-    return buffer(np.ascontiguousarray(array))
+    def _external_table_exists(self, name):
+        """Return True if an external table name exists."""
+        return name in self._get_external_table_names()
 
+    def _create_table_if_not_exists(self, name, dtype, db_con=None):
+        """Create a new table if it does not exits.
 
-def deblob(buf, dtype=float, shape=None):
-    """Convert blob/buffer object to ndarray of correct dtype and shape.
+        Arguments
+        ==========
+        name: str
+            Name of the new table
+        dtype: str
+            Datatype of the value field (typically REAL, INTEGER, TEXT etc.)
+        """
+        if name in all_tables:
+            raise ValueError("External table can not be any of {}"
+                             "".format(all_tables))
 
-    (without creating an extra view)."""
+        if self._external_table_exists(name):
+            return
 
-    if buf is None:
-        return None
-    if len(buf) == 0:
-        array = np.zeros(0, dtype)
-    else:
-        if len(buf) % 2 == 1:
-            # old psycopg2:
-            array = np.fromstring(str(buf)[1:].decode('hex'), dtype)
-        else:
-            array = np.frombuffer(buf, dtype)
-        if not np.little_endian:
-            array.byteswap(True)
-    if shape is not None:
-        array.shape = shape
-    return array
+        con = db_con or self.connection or self._connect()
+        cur = con.cursor()
+        sql = "CREATE TABLE IF NOT EXISTS {} ".format(name)
+        sql += "(key TEXT, value {}, id INTEGER, ".format(dtype)
+        sql += "FOREIGN KEY (id) REFERENCES systems(id))"
+        cur.execute(sql)
 
+        sql = "INSERT INTO information VALUES (?, ?)"
+        # Insert an entry saying that there is a new external table
+        # present and an entry with the datatype
+        cur.execute(sql, ("external_table_name", name))
+        cur.execute(sql, (name+"_dtype", dtype))
+
+        if self.connection is None and db_con is None:
+            con.commit()
+            con.close()
+
+    def delete_external_table(self, name):
+        """Delete an external table."""
+        if not self._external_table_exists(name):
+            return
+
+        con = self.connection or self._connect()
+        cur = con.cursor()
+
+        sql = "DROP TABLE {}".format(name)
+        cur.execute(sql)
+
+        sql = "DELETE FROM information WHERE value=?"
+        cur.execute(sql, (name,))
+        sql = "DELETE FROM information WHERE name=?"
+        cur.execute(sql, (name+"_dtype",))
+
+        if self.connection is None:
+            con.commit()
+            con.close()
+
+    def _convert_to_recognized_types(self, value):
+        """Convert Numpy types to python types."""
+        if np.issubdtype(type(value), np.integer):
+            return int(value)
+        elif np.issubdtype(type(value), np.floating):
+            return float(value)
+        return value
+
+    def _insert_in_external_table(self, cursor, name=None, entries=None):
+        """Insert into external table"""
+        if name is None or entries is None:
+            # There is nothing to do
+            return
+
+        id = entries.pop("id")
+        dtype = self._guess_type(entries)
+        expected_dtype = self._get_value_type_of_table(cursor, name)
+        if dtype != expected_dtype:
+            raise ValueError("The provided data type for table {}"
+                             "is {}, while it is initialized to "
+                             "be of type {}"
+                             "".format(name, dtype, expected_dtype))
+
+        # First we check if entries already exists
+        cursor.execute("SELECT key FROM {} WHERE id=?".format(name), (id,))
+        updates = []
+        for item in cursor.fetchall():
+            value = entries.pop(item[0], None)
+            if value is not None:
+                updates.append(
+                    (value, id, self._convert_to_recognized_types(item[0])))
+
+        # Update entry if key and ID already exists
+        sql = "UPDATE {} SET value=? WHERE id=? AND key=?".format(name)
+        cursor.executemany(sql, updates)
+
+        # Insert the ones that does not already exist
+        inserts = [(k, self._convert_to_recognized_types(v), id)
+                   for k, v in entries.items()]
+        sql = "INSERT INTO {} VALUES (?, ?, ?)".format(name)
+        cursor.executemany(sql, inserts)
+
+    def _guess_type(self, entries):
+        """Guess the type based on the first entry."""
+        values = [v for _, v in entries.items()]
+
+        # Check if all datatypes are the same
+        all_types = [type(v) for v in values]
+        if any([t != all_types[0] for t in all_types]):
+            typenames = [t.__name__ for t in all_types]
+            raise ValueError("Inconsistent datatypes in the table. "
+                             "given types: {}".format(typenames))
+
+        val = values[0]
+        if isinstance(val, int) or np.issubdtype(type(val), np.integer):
+            return "INTEGER"
+        if isinstance(val, float) or np.issubdtype(type(val), np.floating):
+            return "REAL"
+        if isinstance(val, str):
+            return "TEXT"
+        raise ValueError("Unknown datatype!")
+
+    def _get_value_type_of_table(self, cursor, tab_name):
+        """Return the expected value name."""
+        sql = "SELECT value FROM information WHERE name=?"
+        cursor.execute(sql, (tab_name+"_dtype",))
+        return cursor.fetchone()[0]
+
+    def _read_external_table(self, name, id):
+        """Read row from external table."""
+        con = self.connection or self._connect()
+        cur = con.cursor()
+        cur.execute("SELECT * FROM {} WHERE id=?".format(name), (id,))
+        items = cur.fetchall()
+        dictionary = dict([(item[0], item[1]) for item in items])
+
+        if self.connection is None:
+            con.close()
+        return dictionary
 
 if __name__ == '__main__':
     import sys

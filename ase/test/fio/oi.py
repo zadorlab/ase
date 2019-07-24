@@ -1,5 +1,6 @@
 from __future__ import print_function
 import os
+import warnings
 
 import numpy as np
 from ase import Atoms
@@ -21,6 +22,11 @@ try:
     import Scientific
 except ImportError:
     Scientific = 0
+
+try:
+    import netCDF4
+except ImportError:
+    netCDF4 = 0
 
 
 def get_atoms():
@@ -70,33 +76,48 @@ if os.path.isdir(testdir):
 os.mkdir(testdir)
 
 
-for format in sorted(all_formats):
-    if format in ['abinit', 'castep-cell', 'dftb', 'eon', 'gaussian']:
+def test(format):
+    if format in ['abinit', 'castep-cell', 'dftb', 'eon', 'gaussian',
+                  'lammps-data']:
         # Someone should do something ...
-        continue
+        return
 
-    if format in ['v-sim']:
+    if format in ['v-sim', 'mustem']:
         # Standalone test used as not compatible with 1D periodicity
-        continue
+        return
+
+    if format in ['mustem']:
+        # Standalone test used as specific arguments are required
+        return
 
     if format in ['dmol-arc', 'dmol-car', 'dmol-incoor']:
         # We have a standalone dmol test
-        continue
+        return
 
-    if format in ['postgresql', 'trj', 'vti', 'vtu']:
+    if format in ['gif', 'mp4']:
+        # Complex dependencies; see animate.py test
+        return
+
+    if format in ['postgresql', 'trj', 'vti', 'vtu', 'mysql']:
         # Let's not worry about these.
-        continue
+        return
 
     if not matplotlib and format in ['eps', 'png']:
-        continue
+        return
 
     if not etree and format == 'exciting':
-        continue
+        return
 
     if not Scientific and format == 'etsf':
-        continue
+        return
+
+    if not netCDF4 and format == 'netcdftrajectory':
+        return
 
     atoms = get_atoms()
+
+    if format == 'dlp4':
+        atoms.pbc = (1, 1, 0)
 
     images = [atoms, atoms]
 
@@ -128,3 +149,9 @@ for format in sorted(all_formats):
                 assert len(aa) == 6, aa
                 for a in aa:
                     check(a, atoms, format)
+
+for format in sorted(all_formats):
+    with warnings.catch_warnings():
+        if format in ['proteindatabank', 'netcdftrajectory']:
+            warnings.simplefilter('ignore', UserWarning)
+        test(format)

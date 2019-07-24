@@ -10,13 +10,14 @@ from ase.calculators.calculator import (Calculator,
 from ase.units import Bohr, Hartree
 from ase.io.xyz import write_xyz
 from ase.io.vasp import write_vasp
-from ase.parallel import paropen, world, broadcast
+from ase.parallel import world
 
 
 class DFTD3(FileIOCalculator):
     """Grimme DFT-D3 calculator"""
 
     name = 'DFTD3'
+    command = 'dftd3'
     dftd3_implemented_properties = ['energy', 'forces', 'stress']
 
     damping_methods = ['zero', 'bj', 'zerom', 'bjm']
@@ -45,6 +46,7 @@ class DFTD3(FileIOCalculator):
                  command=None,  # Command for running dftd3
                  dft=None,  # DFT calculator
                  atoms=None,
+                 comm=world,
                  **kwargs):
 
         self.dft = None
@@ -56,19 +58,7 @@ class DFTD3(FileIOCalculator):
                                   dft=dft,
                                   **kwargs)
 
-        # If the user is running DFTD3 with another DFT calculator, such as
-        # GPAW, the DFT portion of the calculation should take much longer.
-        # If we only checked for a valid command in self.calculate, the DFT
-        # calculation would run before we realize that we don't know how
-        # to run dftd3. So, we check here at initialization time, to avoid
-        # wasting the user's time.
-        if self.command is None:
-            raise RuntimeError("Don't know how to run DFTD3! Please "
-                               'set the ASE_DFTD3_COMMAND environment '
-                               'variable, or explicitly pass the path '
-                               'to the dftd3 executable to the D3 calculator!')
-        if isinstance(self.command, str):
-            self.command = self.command.split()
+        self.comm = comm
 
     def set(self, **kwargs):
         changed_parameters = {}
@@ -215,7 +205,7 @@ class DFTD3(FileIOCalculator):
         # If a parameter file exists in the working directory, delete it
         # first. If we need that file, we'll recreate it later.
         localparfile = os.path.join(self.directory, '.dftd3par.local')
-        if os.path.isfile(localparfile):
+        if world.rank == 0 and os.path.isfile(localparfile):
             os.remove(localparfile)
 
         # Write XYZ or POSCAR file and .dftd3par.local file if we are using
@@ -224,16 +214,15 @@ class DFTD3(FileIOCalculator):
         command = self._generate_command()
 
         # Finally, call dftd3 and parse results.
-        with paropen(self.label + '.out', 'w') as f:
-            if world.rank == 0:
-                # DFTD3 does not run in parallel
-                # so we only need it to run on 1 core
+        # DFTD3 does not run in parallel
+        # so we only need it to run on 1 core
+        errorcode = 0
+        if self.comm.rank == 0:
+            with open(self.label + '.out', 'w') as f:
                 errorcode = subprocess.call(command,
                                             cwd=self.directory, stdout=f)
-            else:
-                errorcode = None
-        world.barrier()  # Wait for the call() to complete on the master node
-        errorcode = broadcast(errorcode, root=0)
+
+        errorcode = self.comm.sum(errorcode)
 
         if errorcode:
             raise RuntimeError('%s returned an error: %d' %
@@ -257,13 +246,15 @@ class DFTD3(FileIOCalculator):
                      'this system as 3D-periodic!')
             pbc = True
 
-        if pbc:
-            fname = os.path.join(self.directory,
-                                 '{}.POSCAR'.format(self.label))
-            write_vasp(fname, atoms)
-        else:
-            fname = os.path.join(self.directory, '{}.xyz'.format(self.label))
-            write_xyz(fname, atoms, plain=True)
+        if self.comm.rank == 0:
+            if pbc:
+                fname = os.path.join(self.directory,
+                                     '{}.POSCAR'.format(self.label))
+                write_vasp(fname, atoms)
+            else:
+                fname = os.path.join(
+                    self.directory, '{}.xyz'.format(self.label))
+                write_xyz(fname, atoms, plain=True)
 
         # Generate custom damping parameters file. This is kind of ugly, but
         # I don't know of a better way of doing this.
@@ -300,34 +291,49 @@ class DFTD3(FileIOCalculator):
                 damppars.append('6')
 
             damp_fname = os.path.join(self.directory, '.dftd3par.local')
-            with paropen(damp_fname, 'w') as f:
-                f.write(' '.join(damppars))
+            if self.comm.rank == 0:
+                with open(damp_fname, 'w') as f:
+                    f.write(' '.join(damppars))
 
     def read_results(self):
         # parse the energy
         outname = os.path.join(self.directory, self.label + '.out')
-        with open(outname, 'r') as f:
-            for line in f:
-                if line.startswith(' program stopped'):
-                    if 'functional name unknown' in line:
-                        raise RuntimeError('Unknown DFTD3 functional name '
-                                           '"{}". Please check the dftd3.f '
-                                           'source file for the list of '
-                                           'known functionals and their '
-                                           'spelling.'
-                                           ''.format(self.parameters['xc']))
-                    raise RuntimeError('dftd3 failed! Please check the {} '
-                                       'output file and report any errors '
-                                       'to the ASE developers.'
-                                       ''.format(outname))
-                if line.startswith(' Edisp'):
-                    e_dftd3 = float(line.split()[3]) * Hartree
-                    self.results['energy'] = e_dftd3
-                    self.results['free_energy'] = e_dftd3
-                    break
-            else:
-                raise RuntimeError('Could not parse energy from dftd3 output, '
-                                   'see file {}'.format(outname))
+        energy = 0.0
+        if self.comm.rank == 0:
+            with open(outname, 'r') as f:
+                for line in f:
+                    if line.startswith(' program stopped'):
+                        if 'functional name unknown' in line:
+                            message = 'Unknown DFTD3 functional name "{}". ' \
+                                      'Please check the dftd3.f source file ' \
+                                      'for the list of known functionals ' \
+                                      'and their spelling.' \
+                                      ''.format(self.parameters['xc'])
+                        else:
+                            message = 'dftd3 failed! Please check the {} ' \
+                                      'output file and report any errors ' \
+                                      'to the ASE developers.' \
+                                      ''.format(outname)
+                        raise RuntimeError(message)
+
+                    if line.startswith(' Edisp'):
+                        # line looks something like this:
+                        #
+                        #     Edisp /kcal,au,ev: xxx xxx xxx
+                        #
+                        parts = line.split()
+                        assert parts[1][0] == '/'
+                        index = 2 + parts[1][1:-1].split(',').index('au')
+                        e_dftd3 = float(parts[index]) * Hartree
+                        energy = e_dftd3
+                        break
+                else:
+                    raise RuntimeError('Could not parse energy from dftd3 '
+                                       'output, see file {}'.format(outname))
+
+        self.results['energy'] = self.comm.sum(energy)
+        self.results['free_energy'] = self.results['energy']
+
         # FIXME: Calculator.get_potential_energy() simply inspects
         # self.results for the free energy rather than calling
         # Calculator.get_property('free_energy'). For example, GPAW does
@@ -342,25 +348,31 @@ class DFTD3(FileIOCalculator):
                 self.results['free_energy'] += efree
             except PropertyNotImplementedError:
                 pass
+
         if self.parameters['grad']:
             # parse the forces
             forces = np.zeros((len(self.atoms), 3))
             forcename = os.path.join(self.directory, 'dftd3_gradient')
-            with open(forcename, 'r') as f:
-                for i, line in enumerate(f):
-                    forces[i] = np.array([float(x) for x in line.split()])
-            self.results['forces'] = -forces * Hartree / Bohr
+            if self.comm.rank == 0:
+                with open(forcename, 'r') as f:
+                    for i, line in enumerate(f):
+                        forces[i] = np.array([float(x) for x in line.split()])
+                forces *= -Hartree / Bohr
+            self.comm.broadcast(forces, 0)
+            self.results['forces'] = forces
 
             if any(self.atoms.pbc):
                 # parse the stress tensor
                 stress = np.zeros((3, 3))
                 stressname = os.path.join(self.directory, 'dftd3_cellgradient')
-                with open(stressname, 'r') as f:
-                    for i, line in enumerate(f):
-                        stress[i] = np.array([float(x) for x in line.split()])
-
-                stress *= Hartree / Bohr / self.atoms.get_volume()
-                stress = np.dot(stress, self.atoms.cell.T)
+                if self.comm.rank == 0:
+                    with open(stressname, 'r') as f:
+                        for i, line in enumerate(f):
+                            for j, x in enumerate(line.split()):
+                                stress[i, j] = float(x)
+                    stress *= Hartree / Bohr / self.atoms.get_volume()
+                    stress = np.dot(stress, self.atoms.cell.T)
+                self.comm.broadcast(stress, 0)
                 self.results['stress'] = stress.flat[[0, 4, 8, 5, 2, 1]]
 
     def get_property(self, name, atoms=None, allow_calculation=True):
@@ -381,7 +393,7 @@ class DFTD3(FileIOCalculator):
             return dft_result + dftd3_result
 
     def _generate_command(self):
-        command = self.command
+        command = self.command.split()
 
         if any(self.atoms.pbc):
             command.append(self.label + '.POSCAR')

@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-import sys
-
 import numpy as np
 
 from ase.optimize.optimize import Optimizer
@@ -109,11 +107,15 @@ class LBFGS(Optimizer):
             self.r0, self.f0, self.e0, self.task = self.load()
         self.load_restart = True
 
-    def step(self, f):
+    def step(self, f=None):
         """Take a single step
 
         Use the given forces, update the history and calculate the next step --
         then take it"""
+
+        if f is None:
+            f = self.atoms.get_forces()
+
         r = self.atoms.get_positions()
 
         self.update(r, f, self.r0, self.f0)
@@ -322,21 +324,3 @@ class LBFGSLineSearch(LBFGS):
 #            else:
 #                RdR += self.dR * 0.5
 #        return du * RdR
-
-
-class HessLBFGS(LBFGS):
-    """Backwards compatibiliyt class"""
-    def __init__(self, *args, **kwargs):
-        if 'method' in kwargs:
-            del kwargs['method']
-        sys.stderr.write('Please use LBFGS instead of HessLBFGS!')
-        LBFGS.__init__(self, *args, **kwargs)
-
-
-class LineLBFGS(LBFGSLineSearch):
-    """Backwards compatibiliyt class"""
-    def __init__(self, *args, **kwargs):
-        if 'method' in kwargs:
-            del kwargs['method']
-        sys.stderr.write('Please use LBFGSLineSearch instead of LineLBFGS!')
-        LBFGSLineSearch.__init__(self, *args, **kwargs)

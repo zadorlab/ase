@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 
+"""Generate new release of ASE.
+
+This script does not attempt to import ASE - then it would depend on
+which ASE is installed and how - but assumes that it is run from the
+ASE root directory."""
+
 import os
+os.environ['LANGUAGE'] = 'C'
 import subprocess
 import re
 import argparse
 from time import strftime
 
-def runcmd(cmd, output=False, shell=True, error_ok=False):
+def runcmd(cmd, output=False, error_ok=False):
     print('Executing:', cmd)
     try:
         if output:
-            txt = subprocess.check_output(cmd, shell=shell)
+            txt = subprocess.check_output(cmd, shell=True)
             return txt.decode('utf8')
         else:
-            return subprocess.check_call(cmd, shell=shell)
+            return subprocess.check_call(cmd, shell=True)
     except subprocess.CalledProcessError as err:
         if error_ok:
             print('Failed: {}'.format(err))
@@ -28,18 +35,12 @@ bash = runcmd
 def py(cmd, output=False):
     return runcmd('python3 {}'.format(cmd))
 
-def py2(cmd, output=False):
-    return runcmd('python2 {}'.format(cmd))
+def git(cmd, error_ok=False):
+    cmd = 'git {}'.format(cmd)
+    return runcmd(cmd, output=True, error_ok=error_ok)
 
-def git(cmd, shell=True, error_ok=False):
-    if hasattr(cmd, 'swapcase'):
-        cmd = 'git {}'.format(cmd)
-        shell = True
-    else:
-        cmd = ['git'] + cmd
-        shell = False
-    return runcmd(cmd, output=True, shell=shell, error_ok=error_ok)
 
+cwd = os.getcwd()
 versionfile = 'ase/__init__.py'
 
 
@@ -49,25 +50,26 @@ def get_version():
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument('version', nargs='?',
-                 help='new version number')
+    p = argparse.ArgumentParser(description='Generate new release of ASE.',
+                                epilog='Run from the root directory of ASE.')
+    p.add_argument('version', nargs=1,
+                 help='version number for new release')
+    p.add_argument('nextversion', nargs=1,
+                   help='development version after release')
     p.add_argument('--clean', action='store_true',
-                   help='undo changes')
-    p.add_argument('--webpage', action='store_true',
-                   help='update webpage')
+                   help='delete release branch and tag')
     args = p.parse_args()
 
-    if not args.version:
-        p.print_help()
-        print('Current version: {}'.format(get_version()))
-        raise SystemExit
+    try:
+        current_version = get_version()
+    except Exception as err:
+        p.error('Cannot get version: {}.  Are you in the root directory?'
+                .format(err))
 
-    if args.webpage:
-        update_webpage(p, args)
-        return
+    print('Current version: {}'.format(current_version))
 
-    version = args.version
+    version = args.version[0]
+    next_devel_version = args.nextversion[0]
 
     branchname = 'ase-{}'.format(version)
     current_version = get_version()
@@ -77,10 +79,10 @@ def main():
         git('checkout master')
         git('tag -d {}'.format(version), error_ok=True)
         git('branch -D {}'.format(branchname), error_ok=True)
+        git('branch -D {}'.format('web-page'), error_ok=True)
         return
 
     print('New release: {}'.format(version))
-    print('Current version: {}'.format(current_version))
 
     txt = git('status')
     branch = re.match('On branch (\S+)', txt).group(1)
@@ -90,11 +92,6 @@ def main():
 
 
     git('checkout -b {}'.format(branchname))
-
-    majormiddle, minor = version.rsplit('.', 1)
-    minor = int(minor)
-    nextminor = minor + 1
-    next_devel_version = '{}.{}b1'.format(majormiddle, nextminor)
 
     def update_version(version):
         print('Editing {}: version {}'.format(versionfile, version))
@@ -116,7 +113,6 @@ def main():
 
     releasenotes = 'doc/releasenotes.rst'
     lines = []
-    ok = False
 
     searchtxt = re.escape("""\
 Git master branch
@@ -131,7 +127,8 @@ Git master branch
 
 :git:`master <>`.
 
- * No changes yet
+* No changes yet
+
 
 {header}
 {underline}
@@ -139,7 +136,7 @@ Git master branch
 {date}: :git:`{version} <../{version}>`
 """
 
-    date = strftime('%d %B %Y')
+    date = strftime('%d %B %Y').lstrip('0')
     header = 'Version {}'.format(version)
     underline = '=' * len(header)
     replacetxt = replacetxt.format(header=header, version=version,
@@ -210,21 +207,29 @@ News
     with open(sphinxconf, 'w') as fd:
         fd.write(''.join(lines))
 
-    git('add -u')
+    git('add {}'.format(' '.join([versionfile, sphinxconf, installdoc,
+                                  frontpage, releasenotes])))
     git('commit -m "ASE version {}"'.format(version))
     git('tag -s {0} -m "ase-{0}"'.format(version))
 
     py('setup.py sdist > setup_sdist.log')
-    py2('setup.py bdist_wheel > setup_bdist_wheel2.log')
     py('setup.py bdist_wheel > setup_bdist_wheel3.log')
-    bash('gpg --armor --detach-sign dist/ase-{}.tar.gz'.format(version))
+    bash('gpg --armor --yes --detach-sign dist/ase-{}.tar.gz'.format(version))
+    git('checkout -b web-page')
+    git('branch --set-upstream-to=origin/web-page')
+    git('checkout {}'.format(branchname))
     update_version(next_devel_version)
-    git('add -u')
+    git('add {}'.format(versionfile))
     git('branch --set-upstream-to=master')
     git('commit -m "bump version number to {}"'.format(next_devel_version))
 
     print()
     print('Automatic steps done.')
+    print()
+    print('Now is a good time to:')
+    print(' * check the diff')
+    print(' * run the tests')
+    print(' * verify the web-page build')
     print()
     print('Remaining steps')
     print('===============')
@@ -233,17 +238,10 @@ News
     print('git merge {}'.format(branchname))
     print('twine upload '
           'dist/ase-{v}.tar.gz '
-          'dist/ase-{v}-py2-none-any.whl '
           'dist/ase-{v}-py3-none-any.whl '
           'dist/ase-{v}.tar.gz.asc'.format(v=version))
     print('git push --tags origin master  # Assuming your remote is "origin"')
+    print('git checkout web-page')
     print('git push --force origin web-page')
 
-cwd = os.getcwd()
-scriptdir, myfname = os.path.split(__file__)
-asedir = os.path.abspath('{}/../../'.format(scriptdir))
-try:
-    os.chdir(asedir)
-    main()
-finally:
-    os.chdir(cwd)
+main()

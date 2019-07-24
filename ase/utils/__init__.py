@@ -4,25 +4,23 @@ import os
 import pickle
 import sys
 import time
+import string
+import warnings
 from importlib import import_module
 from math import sin, cos, radians, atan2, degrees
 from contextlib import contextmanager
-
-try:
-    from math import gcd
-except ImportError:
-    from fractions import gcd
+from math import gcd
+from pathlib import PurePath, Path
 
 import numpy as np
 
-from ase.utils.formula import formula_hill, formula_metal
-from ase.data import covalent_radii
+from ase.formula import formula_hill, formula_metal
 
 __all__ = ['exec_', 'basestring', 'import_module', 'seterr', 'plural',
            'devnull', 'gcd', 'convert_string_to_fd', 'Lock',
            'opencew', 'OpenLock', 'rotate', 'irotate', 'givens',
            'hsv2rgb', 'hsv', 'pickleload', 'FileNotFoundError',
-           'formula_hill', 'formula_metal']
+           'formula_hill', 'formula_metal', 'PurePath']
 
 
 # Python 2+3 compatibility stuff:
@@ -53,8 +51,10 @@ def seterr(**kwargs):
     See np.seterr() for more details.
     """
     old = np.seterr(**kwargs)
-    yield
-    np.seterr(**old)
+    try:
+        yield
+    finally:
+        np.seterr(**old)
 
 
 def plural(n, word):
@@ -89,6 +89,9 @@ class DevNull:
     def isatty(self):
         return False
 
+    def read(self, n=-1):
+        return ''
+
 
 devnull = DevNull()
 
@@ -105,8 +108,8 @@ def convert_string_to_fd(name, world=None):
         return devnull
     if name == '-':
         return sys.stdout
-    if isinstance(name, basestring):
-        return open(name, 'w')
+    if isinstance(name, (basestring, PurePath)):
+        return open(str(name), 'w')  # str for py3.5 pathlib
     return name  # we assume name is already a file-descriptor
 
 
@@ -147,19 +150,25 @@ def opencew(filename, world=None):
 
 
 class Lock:
-    def __init__(self, name='lock', world=None):
-        self.name = name
-
+    def __init__(self, name='lock', world=None, timeout=float('inf')):
+        self.name = str(name)
+        self.timeout = timeout
         if world is None:
             from ase.parallel import world
         self.world = world
 
     def acquire(self):
+        dt = 0.2
+        t1 = time.time()
         while True:
             fd = opencew(self.name, self.world)
             if fd is not None:
                 break
-            time.sleep(1.0)
+            time_left = self.timeout - (time.time() - t1)
+            if time_left <= 0:
+                raise TimeoutError
+            time.sleep(min(dt, time_left))
+            dt *= 2
 
     def release(self):
         self.world.barrier()
@@ -185,6 +194,56 @@ class OpenLock:
 
     def __exit__(self, type, value, tb):
         pass
+
+
+def search_current_git_hash(arg, world=None):
+    """Search for .git directory and current git commit hash.
+
+    Parameters:
+
+    arg: str (directory path) or python module
+        .git directory is searched from the parent directory of
+        the given directory or module.
+    """
+    if world is None:
+        from ase.parallel import world
+    if world.rank != 0:
+        return None
+
+    # Check argument
+    if isinstance(arg, basestring):
+        # Directory path
+        dpath = arg
+    else:
+        # Assume arg is module
+        dpath = os.path.dirname(arg.__file__)
+    # dpath = os.path.abspath(dpath)
+    # in case this is just symlinked into $PYTHONPATH
+    dpath = os.path.realpath(dpath)
+    dpath = os.path.dirname(dpath)  # Go to the parent directory
+    git_dpath = os.path.join(dpath, '.git')
+    if not os.path.isdir(git_dpath):
+        # Replace this 'if' with a loop if you want to check
+        # further parent directories
+        return None
+    HEAD_file = os.path.join(git_dpath, 'HEAD')
+    if not os.path.isfile(HEAD_file):
+        return None
+    with open(HEAD_file, 'r') as f:
+        line = f.readline().strip()
+    if line.startswith('ref: '):
+        ref = line[5:]
+        ref_file = os.path.join(git_dpath, ref)
+    else:
+        # Assuming detached HEAD state
+        ref_file = HEAD_file
+    if not os.path.isfile(ref_file):
+        return None
+    with open(ref_file, 'r') as f:
+        line = f.readline().strip()
+    if all(c in string.hexdigits for c in line):
+        return line
+    return None
 
 
 def rotate(rotations, rotation=np.identity(3)):
@@ -299,22 +358,6 @@ def hsv(array, s=.9, v=.9):
     return np.reshape(result, array.shape + (3,))
 
 
-def natural_cutoffs(atoms, mult=1, **kwargs):
-    """Generate a radial cutoff for every atom based on covalent radii
-
-    The covalent radii are a reasonable cutoff estimation for bonds in
-    many applications such as neighborlists, so function generates an
-    atoms length list of radii based on this idea.
-
-    atoms: An atoms object
-    mult: A multiplier for all cutoffs, useful for coarse grained adjustment
-    kwargs: Symbol of the atom and its corresponding cutoff, used to override
-            the covalent radii
-    """
-    return [kwargs.get(atom.symbol, covalent_radii[atom.number] * mult)
-            for atom in atoms]
-
-
 # This code does the same, but requires pylab
 # def cmap(array, name='hsv'):
 #     import pylab
@@ -326,3 +369,109 @@ def natural_cutoffs(atoms, mult=1, **kwargs):
 def longsum(x):
     """128-bit floating point sum."""
     return float(np.asarray(x, dtype=np.longdouble).sum())
+
+
+@contextmanager
+def workdir(path, mkdir=False):
+    """Temporarily change, and optionally create, working directory."""
+    path = Path(path)
+    if mkdir:
+        path.mkdir(parents=True, exist_ok=True)
+
+    olddir = os.getcwd()
+    os.chdir(path.name)
+    try:
+        yield  # Yield the Path or dirname maybe?
+    finally:
+        os.chdir(olddir)
+
+
+def iofunction(func, mode):
+    """Decorate func so it accepts either str or file.
+
+    (Won't work on functions that return a generator.)"""
+
+    @functools.wraps(func)
+    def iofunc(file, *args, **kwargs):
+        openandclose = isinstance(file, (basestring, PurePath))
+        fd = None
+        try:
+            if openandclose:
+                fd = open(str(file), mode)
+            else:
+                fd = file
+            obj = func(fd, *args, **kwargs)
+            return obj
+        finally:
+            if openandclose and fd is not None:
+                # fd may be None if open() failed
+                fd.close()
+    return iofunc
+
+
+def writer(func):
+    return iofunction(func, 'w')
+
+
+def reader(func):
+    return iofunction(func, 'r')
+
+
+# The next two functions are for hotplugging into a JSONable class
+# using the jsonable decorator.  We are supposed to have this kind of stuff
+# in ase.io.jsonio, but we'd rather import them from a 'basic' module
+# like ase/utils than one which triggers a lot of extra (cyclic) imports.
+
+def write_json(self, fd):
+    """Write to JSON file."""
+    from ase.io.jsonio import write_json as _write_json
+    _write_json(fd, self)
+
+
+@classmethod
+def read_json(cls, fd):
+    """Read new instance from JSON file."""
+    from ase.io.jsonio import read_json as _read_json
+    obj = _read_json(fd)
+    assert type(obj) is cls
+    return obj
+
+
+def jsonable(name):
+    """Decorator for facilitating JSON I/O with a class.
+
+    Pokes JSON-based read and write functions into the class.
+
+    In order to write an object to JSON, it needs to be a known simple type
+    (such as ndarray, float, ...) or implement todict().  If the class
+    defines a string called ase_objtype, the decoder will want to convert
+    the object back into its original type when reading."""
+    def jsonableclass(cls):
+        cls.ase_objtype = name
+        if not hasattr(cls, 'todict'):
+            raise TypeError('Class must implement todict()')
+
+        # We may want the write and read to be optional.
+        # E.g. a calculator might want to be JSONable, but not
+        # that .write() produces a JSON file.
+        #
+        # This is mostly for 'lightweight' object IO.
+        cls.write = write_json
+        cls.read = read_json
+        return cls
+    return jsonableclass
+
+
+class ExperimentalFeatureWarning(Warning):
+    pass
+
+
+def experimental(func):
+    """Decorator for functions not ready for production use."""
+    @functools.wraps(func)
+    def expfunc(*args, **kwargs):
+        warnings.warn('This function may change or misbehave: {}()'
+                      .format(func.__qualname__),
+                      ExperimentalFeatureWarning)
+        return func(*args, **kwargs)
+    return expfunc

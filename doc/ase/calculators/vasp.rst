@@ -15,8 +15,13 @@ calculation.
 
 
 .. _VASP: http://cms.mpi.univie.ac.at/vasp/
+.. _Vasp 2.0: vasp2.html
 
-
+.. note::
+   A new VASP_ calculator is currently in BETA testing, see
+   :mod:`~ase.calculators.vasp.vasp2`,
+   which implements the calculator using the
+   :class:`~ase.calculators.calculator.FileIOCalculator`.
 
 Environment variables
 =====================
@@ -43,9 +48,21 @@ Set both environment variables in your shell configuration file:
   $ export VASP_SCRIPT=$HOME/vasp/run_vasp.py
   $ export VASP_PP_PATH=$HOME/vasp/mypps
 
-.. highlight:: python
+.. _VASP vdW wiki: https://cms.mpi.univie.ac.at/vasp/vasp/vdW_DF_functional_Langreth_Lundqvist_et_al.html
 
+The following environment variable can be used to automatically copy the
+van der Waals kernel to the calculation directory. The kernel is needed for
+vdW calculations, see `VASP vdW wiki`_, for more details. The kernel is looked
+for, whenever ``luse_vdw=True``.
 
+.. highlight:: bash
+
+::
+
+   $ export ASE_VASP_VDW=$HOME/<path-to-vdw_kernel.bindat-folder>
+
+The environment variable :envvar:`ASE_VASP_VDW` should point to the folder where
+the :file:`vdw_kernel.bindat` file is located.
 
 VASP Calculator
 ===============
@@ -72,6 +89,9 @@ keyword         type       default value   description
 ``reciprocal``  ``bool``   None            Use reciprocal units if
                                            **k**-points are specified
                                            explicitly
+``net_charge``  ``int``    None            Net charge per unit cell (as
+                                           an alternative to specifying
+                                           the total charge ``nelect``)
 ``prec``        ``str``                    Accuracy of calculation
 ``encut``       ``float``                  Kinetic energy cutoff
 ``ediff``       ``float``                  Convergence break condition
@@ -83,6 +103,7 @@ keyword         type       default value   description
 ``sigma``       ``float``                  Width of smearing
 ``nelm``        ``int``                    Maximum number of
                                            SC-iterations
+``ldau_luj``    ``dict``                   LD(S)A+U parameters
 ==============  =========  ==============  ============================
 
 For parameters in the list without default value given, VASP will set
@@ -156,32 +177,59 @@ Setups
 
 For many elements, VASP is distributed with a choice of
 pseudopotential setups. These may be hard/soft variants of the
-pseudopotential or include additional valence electrons. While the
-Vasp calculator will default to the pseudopotential folders with the
-same name as the element, alternative setups may be selected
-with the `setups` dictionary.
+pseudopotential or include additional valence electrons.
+Three base setups are provided:
 
-To use an alternative setup for all instances of an element, simply
-provide the characters which need to be added, e.g.
+    minimal (default):
+        If a PAW folder exists with the same name as the element,
+        this will be used. For the other elements, the PAW setup
+        with the least electrons has been chosen.
+    recommended:
+        corresponds to the `table of recommended PAW setups <https://cms.mpi.univie.ac.at/vasp/vasp/Recommended_PAW_potentials_DFT_calculations_using_vasp_5_2.html>`_ supplied by the VASP developers.
+    materialsproject:
+        corresponds to the `Materials Project recommended PAW setups <https://wiki.materialsproject.org/Pseudopotentials_Choice>`_.
+    gw:
+        corresponds to the `table of recommended setups for GW <https://cms.mpi.univie.ac.at/vasp/vasp/Recommended_GW_PAW_potentials_vasp_5_2.html>`_ supplied by the VASP developers.
+
+Where elements are missing from the default sets, the Vasp Calculator
+will attempt to use a setup folder with the same name as the element.
+A default setup may be selected with the ``setups`` keyword:
+
+.. code-block:: python
+
+    from ase.calculators.vasp import Vasp
+    calc = Vasp(setups='recommended')
+
+To use an alternative setup for all instances of an element, use the
+dictionary form of ``setups`` to provide the characters which need
+to be added to the element name, e.g.
 
 .. code-block:: python
 
    calc = Vasp(xc='PBE', setups={'Li': '_sv'})
 
 will use the ``Li_sv`` all-electron pseudopotential for all Li atoms.
+
 To apply special setups to individual atoms, identify them by their
 zero-indexed number in the atom list and use the full setup name. For
 example,
 
 .. code-block:: python
 
-   calc= Vasp(xc='PBE', setups={3: 'Ga_d'})
+   calc = Vasp(xc='PBE', setups={3: 'Ga_d'})
 
 will treat the Ga atom in position 3 (i.e. the fourth atom) of the
 atoms object as special, with an additional 10 d-block valence
 electrons, while other Ga atoms use the default 3-electron setup and
 other elements use their own default setups. The positional index may
 be quoted as a string (e.g. ``{'3': 'Ga_d'}``).
+
+These approaches may be combined by using the 'base' key to access a
+default set, e.g.
+
+.. code-block:: python
+
+   calc = Vasp(xc='PBE', setups={'base': 'recommended', 'Li': '', 4: 'H.5'})
 
 Spin-polarized calculation
 ==========================
@@ -297,6 +345,23 @@ For example:
 
 returns an acceptable ``kpts`` array (for use with ``reciprocal=True``) as well as plotting information.
 
+LD(S)A+U
+========
+The VASP +U corrections can be turned on using the default VASP parameters explicitly, by manually setting
+the ``ldaul``, ``ldauu`` and ``ldauj`` parameters, as well as enabling ``ldau``.
+
+However, ASE offers a convenient ASE specific keyword to enable these, by using a dictionary construction, through the
+``ldau_luj`` keyword. If the user does not explicitly set ``ldau=False``, then ``ldau=True`` will automatically
+be set if ``ldau_luj`` is set.
+For example:
+
+.. code-block:: python
+
+    calc = Vasp(ldau_luj={'Si': {'L': 1, 'U': 3, 'J': 0}})
+
+will set ``U=3`` on the Si p-orbitals, and will automatically set ``ldau=True`` as well.
+
+
 Restart old calculation
 =======================
 
@@ -326,3 +391,14 @@ calculations, in the directory of the previous calculation do:
 >>> atoms = calc.get_atoms()
 >>> atoms.get_potential_energy()
 -4.7386889999999999
+
+New Calculator
+==============
+
+A new VASP_ calculator is currently in BETA testing, see
+:mod:`~ase.calculators.vasp.vasp2`, which implements the calculator using the
+:class:`~ase.calculators.calculator.FileIOCalculator`.
+
+.. toctree::
+
+   vasp2

@@ -215,7 +215,7 @@ class DataConnection(object):
         return last_id + 1
 
     def get_largest_in_db(self, var):
-        return self.c.select(sort='-{0}'.format(var)).next().get(var)
+        return next(self.c.select(sort='-{0}'.format(var))).get(var)
 
     def add_unrelaxed_candidate(self, candidate, description):
         """ Adds a new candidate which needs to be relaxed. """
@@ -421,7 +421,8 @@ class PrepareDB(object):
 
     def __init__(self, db_file_name, simulation_cell=None, **kwargs):
         if os.path.exists(db_file_name):
-            raise IOError('DB file {0} already exists'.format(db_file_name))
+            raise IOError('DB file {0} already exists'
+                          .format(os.path.abspath(db_file_name)))
         self.db_file_name = db_file_name
         if simulation_cell is None:
             simulation_cell = Atoms()

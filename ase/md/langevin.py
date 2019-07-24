@@ -1,7 +1,6 @@
 """Langevin dynamics class."""
 
 import numpy as np
-from numpy.random import standard_normal
 
 from ase.md.md import MolecularDynamics
 from ase.parallel import world
@@ -28,6 +27,11 @@ class Langevin(MolecularDynamics):
         If True, the position and momentum of the center of mass is
         kept unperturbed.  Default: True.
 
+    rng
+        Random number generator, by default numpy.random.  Must have a
+        standard_normal method matching the signature of
+        numpy.random.standard_normal.
+
     The temperature and friction are normally scalars, but in principle one
     quantity per atom could be specified by giving an array.
 
@@ -46,13 +50,15 @@ class Langevin(MolecularDynamics):
 
     def __init__(self, atoms, timestep, temperature, friction, fixcm=True,
                  trajectory=None, logfile=None, loginterval=1,
-                 communicator=world):
+                 communicator=world, rng=np.random, append_trajectory=False):
         self.temp = temperature
         self.fr = friction
         self.fixcm = fixcm  # will the center of mass be held fixed?
         self.communicator = communicator
+        self.rng = rng
         MolecularDynamics.__init__(self, atoms, timestep, trajectory,
-                                   logfile, loginterval)
+                                   logfile, loginterval,
+                                   append_trajectory=append_trajectory)
         self.updatevars()
 
     def todict(self):
@@ -90,17 +96,29 @@ class Langevin(MolecularDynamics):
         # Works in parallel Asap, #GLOBAL number of atoms:
         self.natoms = self.atoms.get_number_of_atoms()
 
-    def step(self, f):
+    def step(self, f=None):
         atoms = self.atoms
         natoms = len(atoms)
+
+        if f is None:
+            f = atoms.get_forces()
 
         # This velocity as well as xi, eta and a few other variables are stored
         # as attributes, so Asap can do its magic when atoms migrate between
         # processors.
         self.v = atoms.get_velocities()
 
-        self.xi = standard_normal(size=(natoms, 3))
-        self.eta = standard_normal(size=(natoms, 3))
+        self.xi = self.rng.standard_normal(size=(natoms, 3))
+        self.eta = self.rng.standard_normal(size=(natoms, 3))
+
+        # When holonomic constraints for rigid linear triatomic molecules are
+        # present, ask the constraints to redistribute xi and eta within each
+        # triple defined in the constraints. This is needed to achieve the
+        # correct target temperature.
+        for constraint in self.atoms.constraints:
+            if hasattr(constraint, 'redistribute_forces_md'):
+                constraint.redistribute_forces_md(atoms, self.xi, rand=True)
+                constraint.redistribute_forces_md(atoms, self.eta, rand=True)
 
         if self.communicator is not None:
             self.communicator.broadcast(self.xi, 0)

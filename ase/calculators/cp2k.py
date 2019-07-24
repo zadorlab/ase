@@ -174,8 +174,9 @@ class CP2K(Calculator):
         else:
             self.command = 'cp2k_shell'  # default
 
-        Calculator.__init__(self, restart, ignore_bad_restart_file,
-                            label, atoms, **kwargs)
+        Calculator.__init__(self, restart=restart,
+                            ignore_bad_restart_file=ignore_bad_restart_file,
+                            label=label, atoms=atoms, **kwargs)
 
         self._shell = Cp2kShell(self.command, self._debug)
 
@@ -206,14 +207,17 @@ class CP2K(Calculator):
             print("Writting restart to: ", label)
         self.atoms.write(label + '_restart.traj')
         self.parameters.write(label + '_params.ase')
-        open(label + '_results.ase', 'w').write(repr(self.results))
+        from ase.io.jsonio import write_json
+        with open(label + '_results.json', 'w') as fd:
+            write_json(fd, self.results)
 
     def read(self, label):
         'Read atoms, parameters and calculated results from restart files.'
         self.atoms = ase.io.read(label + '_restart.traj')
         self.parameters = Parameters.read(label + '_params.ase')
-        results_txt = open(label + '_results.ase').read()
-        self.results = eval(results_txt, {'array': np.array})
+        from ase.io.jsonio import read_json
+        with open(label + '_results.json') as fd:
+            self.results = read_json(fd)
 
     def calculate(self, atoms=None, properties=None,
                   system_changes=all_changes):
@@ -363,12 +367,23 @@ class CP2K(Calculator):
             root.add_keyword('FORCE_EVAL/DFT/LS_SCF', 'MAX_SCF %d' % p.max_scf)
 
         if p.xc:
-            if p.xc.startswith("XC_"):
+            legacy_libxc = ""
+            for functional in p.xc.split():
+                functional = functional.replace("LDA", "PADE")  # resolve alias
+                xc_sec = root.get_subsection('FORCE_EVAL/DFT/XC/XC_FUNCTIONAL')
+                # libxc input section changed over time
+                if functional.startswith("XC_") and self._shell.version < 3.0:
+                    legacy_libxc += " " + functional # handled later
+                elif functional.startswith("XC_"):
+                    s = InputSection(name='LIBXC')
+                    s.keywords.append('FUNCTIONAL ' + functional)
+                    xc_sec.subsections.append(s)
+                else:
+                    s = InputSection(name=functional.upper())
+                    xc_sec.subsections.append(s)
+            if legacy_libxc:
                 root.add_keyword('FORCE_EVAL/DFT/XC/XC_FUNCTIONAL/LIBXC',
-                                 'FUNCTIONAL ' + p.xc)
-            else:
-                root.add_keyword('FORCE_EVAL/DFT/XC/XC_FUNCTIONAL',
-                                 '_SECTION_PARAMETERS_ ' + p.xc)
+                                 'FUNCTIONAL ' + legacy_libxc)
 
         if p.uks:
             root.add_keyword('FORCE_EVAL/DFT', 'UNRESTRICTED_KOHN_SHAM ON')

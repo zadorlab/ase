@@ -8,19 +8,19 @@ from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.build import molecule
 from ase.gui.i18n import _
-from ase.test import NotAvailable
+import unittest
 
 try:
     import ase.gui.ui as ui
 except ImportError:
-    raise NotAvailable
+    raise unittest.SkipTest
 
 from ase.gui.gui import GUI
 from ase.gui.save import save_dialog
 
 
 if not os.environ.get('DISPLAY'):
-    raise NotAvailable
+    raise unittest.SkipTest
 
 
 class Error:
@@ -83,12 +83,18 @@ def color(gui):
     a = Atoms('C10', magmoms=np.linspace(1, -1, 10))
     a.positions[:] = np.linspace(0, 9, 10)[:, None]
     a.calc = SinglePointCalculator(a, forces=a.positions)
+    che = np.linspace(100, 110, 10)
+    mask = [0] * 10
+    mask[5] = 1
+    a.set_array('corehole_energies', np.ma.array(che, mask=mask))
     gui.new_atoms(a)
     c = gui.colors_window()
     c.toggle('force')
-    text = c.toggle('magmom')
-    assert [button.active for button in c.radio.buttons] == [1, 0, 1, 0, 0, 1]
-    assert text.rsplit('[', 1)[1].startswith('-1.000000,1.000000]')
+    c.toggle('magmom')
+    activebuttons = [button.active for button in c.radio.buttons]
+    assert activebuttons == [1, 0, 1, 0, 0, 1, 1, 1], activebuttons
+    c.toggle('corehole_energies')
+    c.change_mnmx(101, 120)
 
 
 @test
@@ -101,6 +107,7 @@ def settings(gui):
 
 @test
 def rotate(gui):
+    gui.window['toggle-show-bonds'] = True
     gui.new_atoms(molecule('H2O'))
     gui.rotate_window()
 
@@ -112,6 +119,14 @@ def open_and_save(gui):
         mol.write('h2o.json')
     gui.open(filename='h2o.json')
     save_dialog(gui, 'h2o.cif@-1')
+
+
+@test
+def test_fracocc(gui):
+    from ase.test.fio.cif import content
+    with open('./fracocc.cif', 'w') as f:
+        f.write(content)
+    gui.open(filename='fracocc.cif')
 
 
 p = argparse.ArgumentParser()
@@ -140,3 +155,68 @@ for name in args.tests or alltests:
         if not args.pause:
             gui.exit()
     gui.run(test=f)
+
+
+import os
+from functools import partial
+
+import unittest
+
+try:
+    import ase.gui.ui as ui
+except ImportError:
+    raise unittest.SkipTest
+
+
+if not os.environ.get('DISPLAY'):
+    raise unittest.SkipTest
+
+
+def window():
+
+    def hello(event=None):
+        print('hello', event)
+
+    menu = [('Hi', [ui.MenuItem('_Hello', hello, 'Ctrl+H')]),
+            ('Hell_o', [ui.MenuItem('ABC', hello, choices='ABC')])]
+    win = ui.MainWindow('Test', menu=menu)
+
+    win.add(ui.Label('Hello'))
+    win.add(ui.Button('Hello', hello))
+
+    r = ui.Rows([ui.Label(x * 7) for x in 'abcd'])
+    win.add(r)
+    r.add('11111\n2222\n333\n44\n5')
+
+    def abc(x):
+        print(x, r.rows)
+
+    cb = ui.ComboBox(['Aa', 'Bb', 'Cc'], callback=abc)
+    win.add(cb)
+
+    rb = ui.RadioButtons(['A', 'B', 'C'], 'ABC', abc)
+    win.add(rb)
+
+    b = ui.CheckButton('Hello')
+
+    def hi():
+        print(b.value, rb.value, cb.value)
+        del r[2]
+        r.add('-------------')
+
+    win.add([b, ui.Button('Hi', hi)])
+
+    return win
+
+
+def run():
+    win = window()
+    win.test(partial(test, win))
+
+
+def test(win):
+    win.things[1].callback()
+    win.things[1].callback()
+    win.close()
+
+run()

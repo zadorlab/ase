@@ -3,12 +3,16 @@ from math import sqrt
 
 import numpy as np
 
+from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.constraints import FixAtoms
 from ase.data import covalent_radii
 from ase.gui.defaults import read_defaults
 from ase.io import read, write, string2index
 from ase.gui.i18n import _
+from ase.geometry import find_mic
+
+import warnings
 
 
 class Images:
@@ -16,8 +20,9 @@ class Images:
         self.covalent_radii = covalent_radii.copy()
         self.config = read_defaults()
         self.atom_scale = self.config['radii_scale']
-        if images is not None:
-            self.initialize(images)
+        if images is None:
+            images = [Atoms()]
+        self.initialize(images)
 
     def __len__(self):
         return len(self._images)
@@ -48,6 +53,9 @@ class Images:
                                  if not isinstance(c, FixAtoms)]
             atoms.constraints.append(FixAtoms(mask=~dynamic))
 
+    def scale_radii(self, scaling_factor):
+        self.covalent_radii *= scaling_factor
+
     def get_energy(self, atoms):
         try:
             e = atoms.get_potential_energy() * self.repeat.prod()
@@ -61,7 +69,7 @@ class Images:
         except RuntimeError:
             return None
         else:
-            return np.tile(F.T, self.repeat.prod()).T
+            return F
 
     def initialize(self, images, filenames=None, init_magmom=False):
         nimages = len(images)
@@ -103,8 +111,8 @@ class Images:
             # but copying actually forgets things like the attached
             # calculator (might have forces/energies
             self._images.append(atoms)
-            self.have_varying_species |= np.array_equal(self[0].numbers,
-                                                        atoms.numbers)
+            self.have_varying_species |= not np.array_equal(self[0].numbers,
+                                                            atoms.numbers)
             if hasattr(self, 'Q'):
                 assert False  # XXX askhl fix quaternions
                 self.Q[i] = atoms.get_quaternions()
@@ -127,39 +135,108 @@ class Images:
         radii *= self.atom_scale
         return radii
 
-    def prepare_new_atoms(self):
-        "Marks that the next call to append_atoms should clear the images."
-        self.next_append_clears = True
+    def read(self, filenames, default_index=':', filetype=None):
+        from ase.utils import basestring
+        if isinstance(default_index, basestring):
+            default_index = string2index(default_index)
 
-    def append_atoms(self, atoms, filename=None):
-        "Append an atoms object to the images already stored."
-        self.images.append(atoms)
-        self.filenames.append(filename)
-        self.initialize(self.images, filenames=self.filenames)
-        return
-
-    def read(self, filenames, index=-1, filetype=None):
         images = []
         names = []
         for filename in filenames:
-            i = read(filename, index, filetype)
+            from ase.io.formats import parse_filename
 
-            if not isinstance(i, list):
-                i = [i]
-            images.extend(i)
-            names.extend([filename] * len(i))
+            if '@' in filename and 'postgres' not in filename or \
+               'postgres' in filename and filename.count('@') == 2:
+                actual_filename, index = parse_filename(filename, None)
+            else:
+                actual_filename, index = parse_filename(filename,
+                                                        default_index)
+            imgs = read(filename, index, filetype)
+            if hasattr(imgs, 'iterimages'):
+                imgs = list(imgs.iterimages())
+
+            images.extend(imgs)
+
+            # Name each file as filename@index:
+            if isinstance(index, slice):
+                start = index.start or 0
+                step = index.step or 1
+            else:
+                start = index
+                step = 1
+            for i, img in enumerate(imgs):
+                if isinstance(start, int):
+                    names.append('{}@{}'.format(
+                        actual_filename, start + i * step))
+                else:
+                    names.append('{}@{}'.format(actual_filename, start))
 
         self.initialize(images, names)
 
+    def repeat_results(self, atoms, repeat=None, oldprod=None):
+        """Return a dictionary which updates the magmoms, energy and forces
+        to the repeated amount of atoms.
+        """
+        def getresult(name, get_quantity):
+            # ase/io/trajectory.py line 170 does this by using
+            # the get_property(prop, atoms, allow_calculation=False)
+            # so that is an alternative option.
+            try:
+                if (not atoms.calc or
+                        atoms.calc.calculation_required(atoms, [name])):
+                    quantity = None
+                else:
+                    quantity = get_quantity()
+            except Exception as err:
+                quantity = None
+                errmsg = ('An error occured while retrieving {} '
+                          'from the calculator: {}'.format(name, err))
+                warnings.warn(errmsg)
+            return quantity
+
+        if repeat is None:
+            repeat = self.repeat.prod()
+        if oldprod is None:
+            oldprod = self.repeat.prod()
+
+        results = {}
+
+        original_length = len(atoms) // oldprod
+        newprod = repeat.prod()
+
+        # Read the old properties
+        magmoms = getresult('magmoms', atoms.get_magnetic_moments)
+        magmom = getresult('magmom', atoms.get_magnetic_moment)
+        energy = getresult('energy', atoms.get_potential_energy)
+        forces = getresult('forces', atoms.get_forces)
+
+        # Update old properties to the repeated image
+        if magmoms is not None:
+            magmoms = np.tile(magmoms[:original_length], newprod)
+            results['magmoms'] = magmoms
+
+        if magmom is not None:
+            magmom = magmom * newprod / oldprod
+            results['magmom'] = magmom
+
+        if forces is not None:
+            forces = np.tile(forces[:original_length].T, newprod).T
+            results['forces'] = forces
+
+        if energy is not None:
+            energy = energy * newprod / oldprod
+            results['energy'] = energy
+
+        return results
+
     def repeat_unit_cell(self):
         for atoms in self:
-            # Get quantities taking into account current repeat():
-            ref_energy = self.get_energy(atoms)
-            ref_forces = self.get_forces(atoms)
-            atoms.calc = SinglePointCalculator(atoms,
-                                               energy=ref_energy,
-                                               forces=ref_forces)
+            # Get quantities taking into account current repeat():'
+            results = self.repeat_results(atoms, self.repeat.prod(),
+                                          oldprod=self.repeat.prod())
+
             atoms.cell *= self.repeat.reshape((3, 1))
+            atoms.calc = SinglePointCalculator(atoms, **results)
         self.repeat = np.ones(3, int)
 
     def repeat_images(self, repeat):
@@ -168,6 +245,7 @@ class Images:
         oldprod = self.repeat.prod()
         images = []
         constraints_removed = False
+
         for i, atoms in enumerate(self):
             refcell = atoms.get_cell()
             fa = []
@@ -177,9 +255,17 @@ class Images:
                 else:
                     constraints_removed = True
             atoms.set_constraint(fa)
-            del atoms[len(atoms) // oldprod:]
+
+            # Update results dictionary to repeated atoms
+            results = self.repeat_results(atoms, repeat, oldprod)
+
+            del atoms[len(atoms) // oldprod:]  # Original atoms
+
             atoms *= repeat
             atoms.cell = refcell
+
+            atoms.calc = SinglePointCalculator(atoms, **results)
+
             images.append(atoms)
 
         if constraints_removed:
@@ -282,11 +368,14 @@ class Images:
                 xy = np.empty((nvariables, nimages))
             xy[:, i] = data
             if i + 1 < nimages and not self.have_varying_species:
-                s += sqrt(((self[i + 1].positions - R)**2).sum())
+                dR = find_mic(self[i + 1].positions - R, self[i].get_cell(),
+                              self[i].get_pbc())[0]
+                s += sqrt((dR**2).sum())
         return xy
 
-    def write(self, filename, rotations='', show_unit_cell=False, bbox=None,
+    def write(self, filename, rotations='', bbox=None,
               **kwargs):
+        # XXX We should show the unit cell whenever there is one
         indices = range(len(self))
         p = filename.rfind('@')
         if p != -1:
@@ -303,7 +392,7 @@ class Images:
         images = [self.get_atoms(i) for i in indices]
         if len(filename) > 4 and filename[-4:] in ['.eps', '.png', '.pov']:
             write(filename, images,
-                  rotation=rotations, show_unit_cell=show_unit_cell,
+                  rotation=rotations,
                   bbox=bbox, **kwargs)
         else:
             write(filename, images, **kwargs)

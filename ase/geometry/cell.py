@@ -2,6 +2,14 @@ from __future__ import print_function, division
 # Copyright (C) 2010, Jesper Friis
 # (see accompanying license files for details).
 
+# XXX bravais objects need to hold tolerance eps, *or* temember variant
+# from the beginning.
+#
+# Should they hold a 'cycle' argument or other data to reconstruct a particular
+# cell?  (E.g. rotation, niggli transform)
+#
+# Implement total ordering of Bravais classes 1-14
+
 import numpy as np
 from numpy import pi, sin, cos, arccos, sqrt, dot
 from numpy.linalg import norm
@@ -118,7 +126,9 @@ def cellpar_to_cell(cellpar, ab_normal=(0, 0, 1), a_direction=None):
     vb = b * np.array([cos_gamma, sin_gamma, 0])
     cx = cos_beta
     cy = (cos_alpha - cos_beta * cos_gamma) / sin_gamma
-    cz = sqrt(1. - cx * cx - cy * cy)
+    cz_sqr = 1. - cx * cx - cy * cy
+    assert cz_sqr >= 0
+    cz = sqrt(cz_sqr)
     vc = c * np.array([cx, cy, cz])
 
     # Convert to the Cartesian x,y,z-system
@@ -171,11 +181,10 @@ def crystal_structure_from_cell(cell, eps=2e-4, niggli_reduce=True):
     elif abs(angles - pi / 2).max() < eps:
         return 'orthorhombic'
     elif (abs(a - b) < eps and
-          abs(gamma - pi / 3 * 2) < eps and
+          (abs(gamma - pi / 3 * 2) < eps or abs(gamma - pi / 3) < eps) and
           abs(angles[:2] - pi / 2).max() < eps):
         return 'hexagonal'
-    elif (c >= a and c >= b and beta > pi / 2 and
-          abs(angles[::2] - pi / 2).max() < eps):
+    elif (abs(angles - pi / 2) > eps).sum() == 1:
         return 'monoclinic'
     elif (abc.ptp() < eps and angles.ptp() < eps and
           np.abs(angles).max() < pi / 2):
@@ -204,9 +213,11 @@ def complete_cell(cell):
         cell.flat[::4] = 1.0
     if len(missing) == 2:
         # Must decide two vectors:
-        i = 3 - missing.sum()
-        assert abs(cell[i, missing]).max() < 1e-16, "Don't do that"
-        cell[missing, missing] = 1.0
+        V, s, WT = np.linalg.svd(cell.T)
+        sf = [s[0], 1, 1]
+        cell = (V @ np.diag(sf) @ WT).T
+        if np.sign(np.linalg.det(cell)) < 0:
+            cell[missing[0]] = -cell[missing[0]]
     elif len(missing) == 1:
         i = missing[0]
         cell[i] = np.cross(cell[i - 2], cell[i - 1])
@@ -225,3 +236,7 @@ def orthorhombic(cell):
     if not is_orthorhombic(cell):
         raise ValueError('Not orthorhombic')
     return cell.diagonal().copy()
+
+
+# We make the Cell object available for import from here for compatibility
+from ase.cell import Cell  # noqa

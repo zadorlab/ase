@@ -86,9 +86,16 @@ class TrajectoryWriter:
         self.properties = properties
 
         self.description = {}
-        self._open(filename, mode)
         self.header_data = None
         self.multiple_headers = False
+
+        self._open(filename, mode)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb):
+        self.close()
 
     def set_description(self, description):
         self.description.update(description)
@@ -99,10 +106,9 @@ class TrajectoryWriter:
             raise ValueError('mode must be "w" or "a".')
         if self.master:
             self.backend = ulm.open(filename, mode, tag='ASE-Trajectory')
-            if len(self.backend) > 0:
-                r = ulm.open(filename)
-                self.numbers = r.numbers
-                self.pbc = r.pbc
+            if len(self.backend) > 0 and mode == 'a':
+                atoms = Trajectory(filename)[0]
+                self.header_data = get_header_data(atoms)
         else:
             self.backend = ulm.DummyWriter()
 
@@ -119,7 +125,7 @@ class TrajectoryWriter:
         if atoms is None:
             atoms = self.atoms
 
-        for image in atoms._images_():
+        for image in atoms.iterimages():
             self._write_atoms(image, **kwargs)
 
     def _write_atoms(self, atoms, **kwargs):
@@ -157,9 +163,7 @@ class TrajectoryWriter:
             c = b.child('calculator')
             c.write(name=calc.name)
             if hasattr(calc, 'todict'):
-                d = calc.todict()
-                if d:
-                    c.write(parameters=d)
+                c.write(parameters=calc.todict())
             for prop in all_properties:
                 if prop in kwargs:
                     x = kwargs[prop]
@@ -216,17 +220,15 @@ class TrajectoryReader:
 
         self._open(filename)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, tb):
+        self.close()
+
     def _open(self, filename):
         import ase.io.ulm as ulm
-        try:
-            self.backend = ulm.open(filename, 'r')
-        except ulm.InvalidULMFileError:
-            raise RuntimeError('This is not a valid ASE trajectory file. '
-                               'If this is an old-format (version <3.9) '
-                               'PickleTrajectory file you can convert it '
-                               'with ase.io.trajectory.convert("%s") '
-                               'or:\n\n $ python -m ase.io.trajectory %s'
-                               % (filename, filename))
+        self.backend = ulm.open(filename, 'r')
         self._read_header()
 
     def _read_header(self):
@@ -258,13 +260,20 @@ class TrajectoryReader:
                                           self.constraints])
         if 'calculator' in b:
             results = {}
+            implemented_properties = []
             c = b.calculator
             for prop in all_properties:
                 if prop in c:
                     results[prop] = c.get(prop)
+                    implemented_properties.append(prop)
             calc = SinglePointCalculator(atoms, **results)
             calc.name = b.calculator.name
+            calc.implemented_properties = implemented_properties
+
+            if 'parameters' in c:
+                calc.parameters.update(c.parameters)
             atoms.set_calculator(calc)
+
         return atoms
 
     def __len__(self):
@@ -341,20 +350,19 @@ def write_atoms(backend, atoms, write_header=True):
         b.write(charges=atoms.get_initial_charges())
 
 
-def read_traj(filename, index):
-    trj = TrajectoryReader(filename)
+def read_traj(fd, index):
+    trj = TrajectoryReader(fd)
     for i in range(*index.indices(len(trj))):
         yield trj[i]
 
 
-def write_traj(filename, images):
+def write_traj(fd, images):
     """Write image(s) to trajectory."""
-    trj = TrajectoryWriter(filename, mode='w')
+    trj = TrajectoryWriter(fd)
     if isinstance(images, Atoms):
         images = [images]
     for atoms in images:
         trj.write(atoms)
-    trj.close()
 
 
 class OldCalculatorWrapper:

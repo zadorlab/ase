@@ -8,8 +8,6 @@ Written by:
 See accompanying license files for details.
 """
 
-import re 
-
 import numpy as np
 
 import ase.units
@@ -40,13 +38,53 @@ allowed_dft_functionals = ['lsda',  # = 'svwn'
 
 
 def read_gaussian_out(filename, index=-1, quantity='atoms'):
-    """"Interface to GaussianReader and returns various quantities"""
+    """"Interface to GaussianReader and returns various quantities.
+        No support for multiple images in one file!
+    - quantity = 'structures' -> all structures from the file
+    - quantity = 'atoms' -> structure from the archive section
+    - quantity = 'energy' -> from the archive section
+    - quantity = 'force' -> last entry from the file
+    - quantity = 'dipole' -> from the archive section
+    - quantity = 'version' -> from the archive section
+    - quantity = 'multiplicity' -> from the archive section
+    - quantity = 'charge' -> from the archive section"""
     energy = 0.0
-    
-    all_data = GR(filename)
-    if len(all_data) == 0:
-        # no archive was found, TODO use other reader methods
 
+    tmpGR = GR(filename, read_structures=bool(quantity == 'structures'))
+
+    if quantity == 'structures':
+        structures = tmpGR.get_structures()
+
+    data = tmpGR[index]
+    #fix: io.formats passes a slice as index, resulting in data beeing a list
+    if isinstance(data, list) and len(data) > 1:
+        msg = 'Cannot parse multiple images from Gaussian out files at this'
+        msg += ' time.  Please select a single image.'
+        raise RuntimeError(msg)
+    elif isinstance(data,list):
+        data = data[-1]
+
+    atomic_numbers = data['Atomic_numbers']
+    formula = str()
+    for number in atomic_numbers:
+        formula += chemical_symbols[number]
+
+    positions = np.array(data['Positions'])
+    method = data['Method']
+    version = data['Version']
+    charge = data['Charge']
+    multiplicity = data['Multiplicity']
+
+    if method.lower()[1:] in allowed_dft_functionals:
+        method = 'HF'
+
+    atoms = Atoms(formula, positions=positions)
+
+    for key, value in data.items():
+        if (key in method):
+            energy = value
+
+    try:
         if isinstance(filename, basestring):
             fileobj = open(filename, 'r')
         else:
@@ -55,132 +93,40 @@ def read_gaussian_out(filename, index=-1, quantity='atoms'):
             fileobj.seek(0)
 
         lines = fileobj.readlines()
-        
-        #read the positions: 
-        positions = []
-        for ind, line in enumerate(reversed(lines)):
-            if re.search('Input orientation:', line) != None:
-                j = 0
-                while 1:
-                    if '---------' in lines[-ind+4+j]:
-                        break
-                    else:
-                        pos = np.array(lines[-ind+4+j].split()[3:6]).astype(float)
-                        positions.append(pos)
-                    j += 1
-                break
-        natom = len(positions)
-        
-        #read the forces
         iforces = list()
         for n, line in enumerate(lines):
             if ('Forces (Hartrees/Bohr)' in line):
                 forces = list()
-                for j in range(natom):
+                for j in range(len(atoms)):
                     forces += [[float(lines[n + j + 3].split()[2]),
                                 float(lines[n + j + 3].split()[3]),
                                 float(lines[n + j + 3].split()[4])]]
                 iforces.append(np.array(forces))
         convert = ase.units.Hartree / ase.units.Bohr
         forces = np.array(iforces) * convert
-        
-        #read the energy
-        for line in reversed(lines):
-            if re.search('SCF Done', line) != None:
-                energy = float(line.split()[4])
-                break
+    except:
+        forces = None
 
-        #todo: read other quantities (dipole, multiplicity, atoms, version, charge)
-        
+    energy *= ase.units.Hartree  # Convert the energy from a.u. to eV
+    calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
+    atoms.set_calculator(calc)
 
-        if (quantity == 'energy'):
-            return energy
-        elif (quantity == 'positions'):
-            return positions
-        elif (quantity == 'forces'):
-            return forces[index]
-        elif (quantity == 'dipole'):
-            #todo
-            return []
-        elif (quantity == 'multiplicity'):
-            #todo
-            return 1
-    else:
-        data = GR(filename)[index]
-        if isinstance(data, list):
-            msg = 'Cannot parse multiple images from Gaussian out files at this'
-            msg += ' time.  Please select a single image.'
-            raise RuntimeError(msg)
-
-        atomic_numbers = data['Atomic_numbers']
-        formula = str()
-        for number in atomic_numbers:
-            formula += chemical_symbols[number]
-
-        positions = np.array(data['Positions'])
-        method = data['Method']
-        version = data['Version']
-        charge = data['Charge']
-        multiplicity = data['Multiplicity']
-
-        if method.lower()[1:] in allowed_dft_functionals:
-            method = 'HF'
-
-        atoms = Atoms(formula, positions=positions)
-
-        for key, value in data.items():
-            if (key in method):
-                energy = value
-
-        try:
-            if isinstance(filename, basestring):
-                fileobj = open(filename, 'r')
-            else:
-                fileobj = filename
-                # Re-wind the file in case it was previously read.
-                fileobj.seek(0)
-
-            lines = fileobj.readlines()
-            iforces = list()
-            for n, line in enumerate(lines):
-                if ('Forces (Hartrees/Bohr)' in line):
-                    forces = list()
-                    for j in range(len(atoms)):
-                        forces += [[float(lines[n + j + 3].split()[2]),
-                                    float(lines[n + j + 3].split()[3]),
-                                    float(lines[n + j + 3].split()[4])]]
-                    iforces.append(np.array(forces))
-                if ('SCF Done' in line):
-                    energy = float(line.split()[4])
-            convert = ase.units.Hartree / ase.units.Bohr
-            forces = np.array(iforces) * convert
-        except:
-            forces = None
-
-        energy *= ase.units.Hartree  # Convert the energy from a.u. to eV
-        calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
-        atoms.set_calculator(calc)
-
-        if (quantity == 'energy'):
-            return energy
-        elif (quantity == 'positions'):
-            return positions
-        elif (quantity == 'forces'):
-            return forces[index]
-        elif (quantity == 'dipole'):
-            if 'Dipole' in data:
-                return np.array(data['Dipole'])
-            else:
-                #todo
-                return []
-        elif (quantity == 'atoms'):
-            return atoms
-        elif (quantity == 'version'):
-            return version
-        elif (quantity == 'multiplicity'):
-            return multiplicity
-        elif (quantity == 'charge'):
-            return charge
+    if (quantity == 'energy'):
+        return energy
+    elif (quantity == 'forces'):
+        return forces[index]
+    elif (quantity == 'dipole'):
+        return np.array(data['Dipole'])
+    elif (quantity == 'atoms'):
+        return atoms
+    elif (quantity == 'version'):
+        return version
+    elif (quantity == 'multiplicity'):
+        return multiplicity
+    elif (quantity == 'charge'):
+        return charge
+    elif (quantity == 'structures'):
+        return structures
 
 
 def read_gaussian(filename):

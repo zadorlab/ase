@@ -4,7 +4,7 @@ try:
     import tkinter as tk
     import tkinter.ttk as ttk
     from tkinter.messagebox import askokcancel as ask_question
-    from tkinter.messagebox import showerror, showwarning
+    from tkinter.messagebox import showerror, showwarning, showinfo
     from tkinter.filedialog import LoadFileDialog, SaveFileDialog
 except ImportError:
     # Python 2
@@ -14,7 +14,7 @@ except ImportError:
     except ImportError:
         ttk = None
     from tkMessageBox import (askokcancel as ask_question, showerror,
-                              showwarning)
+                              showwarning, showinfo)
     from FileDialog import LoadFileDialog, SaveFileDialog
 
 import re
@@ -31,7 +31,7 @@ __all__ = [
     'error', 'ask_question', 'MainWindow', 'LoadFileDialog', 'SaveFileDialog',
     'ASEGUIWindow', 'Button', 'CheckButton', 'ComboBox', 'Entry', 'Label',
     'Window', 'MenuItem', 'RadioButton', 'RadioButtons', 'Rows', 'Scale',
-    'showwarning', 'SpinBox', 'Text']
+    'showinfo', 'showwarning', 'SpinBox', 'Text']
 
 
 if sys.platform == 'darwin':
@@ -74,9 +74,11 @@ class BaseWindow(object):
             self.win.protocol('WM_DELETE_WINDOW', self.close)
 
         self.things = []
+        self.exists = True
 
     def close(self):
         self.win.destroy()
+        self.exists = False
 
     def title(self, txt):
         self.win.title(txt)
@@ -191,7 +193,8 @@ class CheckButton(Widget):
         self.callback = callback
 
     def create(self, parent):
-        self.check = tk.Checkbutton(parent, text=self.text, var=self.var, command=self.callback)
+        self.check = tk.Checkbutton(parent, text=self.text,
+                                    var=self.var, command=self.callback)
         return self.check
 
     @property
@@ -200,14 +203,16 @@ class CheckButton(Widget):
 
 
 class SpinBox(Widget):
-    def __init__(self, value, start, end, step, callback=None):
+    def __init__(self, value, start, end, step, callback=None,
+                 rounding=None, width=6):
         self.callback = callback
+        self.rounding = rounding
         self.creator = partial(tk.Spinbox,
                                from_=start,
                                to=end,
                                increment=step,
                                command=callback,
-                               width=6)
+                               width=width)
         self.initial = str(value)
 
     def create(self, parent):
@@ -228,6 +233,11 @@ class SpinBox(Widget):
     @value.setter
     def value(self, x):
         self.widget.delete(0, 'end')
+        if '.' in str(x) and self.rounding is not None:
+            try:
+                x = round(float(x), self.rounding)
+            except (ValueError, TypeError):
+                pass
         self.widget.insert(0, x)
 
 
@@ -335,8 +345,8 @@ if ttk is not None:
             self.creator = partial(ttk.Combobox,
                                    values=labels)
 
-        def create(self, parrent):
-            widget = Widget.create(self, parrent)
+        def create(self, parent):
+            widget = Widget.create(self, parent)
             widget.current(0)
             if self.callback:
                 def callback(event):
@@ -538,6 +548,38 @@ def bind(callback, modifier=None):
     return handle
 
 
+class ASEFileChooser(LoadFileDialog):
+    def __init__(self, win, formatcallback=lambda event: None):
+        from ase.io.formats import all_formats, get_ioformat
+        LoadFileDialog.__init__(self, win, _('Open ...'))
+        labels = [_('Automatic')]
+        values = ['']
+
+        def key(item):
+            return item[1][0]
+
+        for format, (description, code) in sorted(all_formats.items(),
+                                                  key=key):
+            io = get_ioformat(format)
+            if io.read and description != '?':
+                labels.append(_(description))
+                values.append(format)
+
+        self.format = None
+
+        def callback(value):
+            self.format = value
+
+        Label(_('Choose parser:')).pack(self.top)
+        formats = ComboBox(labels, values, callback)
+        formats.pack(self.top)
+
+
+def show_io_error(filename, err):
+    showerror(_('Read error'),
+              _('Could not read {}: {}'.format(filename, err)))
+
+
 class ASEGUIWindow(MainWindow):
     def __init__(self, close, menu, config,
                  scroll, scroll_event,
@@ -546,10 +588,13 @@ class ASEGUIWindow(MainWindow):
 
         self.size = np.array([450, 450])
 
+        self.fg = config['gui_foreground_color']
+        self.bg = config['gui_background_color']
+
         self.canvas = tk.Canvas(self.win,
                                 width=self.size[0],
                                 height=self.size[1],
-                                bg='white',
+                                bg=self.bg,
                                 highlightthickness=0)
         self.canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
@@ -564,15 +609,17 @@ class ASEGUIWindow(MainWindow):
         self.canvas.bind('<Control-ButtonRelease>', bind(release, 'ctrl'))
         self.canvas.bind('<Shift-ButtonRelease>', bind(release, 'shift'))
         self.canvas.bind('<Configure>', resize)
-        self.win.bind('<MouseWheel>', bind(scroll_event))
-        for key in ['Key', 'Next', 'Prior']:
-            # Next and Prior are PageUp/Dn, referring to Z axis.
-            self.win.bind('<{}>'.format(key), bind(scroll))
-            self.win.bind('<Shift-{}>'.format(key), bind(scroll, 'shift'))
-            self.win.bind('<Control-{}>'.format(key), bind(scroll, 'ctrl'))
+        if not config['swap_mouse']:
+            self.canvas.bind('<Shift-B{right}-Motion>'.format(right=right),
+                             bind(scroll))
+        else:
+            self.canvas.bind('<Shift-B1-Motion>',
+                             bind(scroll))
 
-        self.fg = config['gui_foreground_color']
-        self.bg = config['gui_background_color']
+        self.win.bind('<MouseWheel>', bind(scroll_event))
+        self.win.bind('<Key>', bind(scroll))
+        self.win.bind('<Shift-Key>', bind(scroll, 'shift'))
+        self.win.bind('<Control-Key>', bind(scroll, 'ctrl'))
 
     def update_status_line(self, text):
         self.status.config(text=text)
@@ -598,6 +645,21 @@ class ASEGUIWindow(MainWindow):
             width = 1
         self.canvas.create_oval(*tuple(int(x) for x in bbox), fill=color,
                                 outline=outline, width=width)
+
+    def arc(self, color, selected, start, extent, *bbox):
+        if selected:
+            outline = '#004500'
+            width = 3
+        else:
+            outline = 'black'
+            width = 1
+        self.canvas.create_arc(*tuple(int(x) for x in bbox),
+                                start=start,
+                                extent=extent,
+                                fill=color,
+                                outline=outline,
+                                width=width)
+
 
     def line(self, bbox, width=1):
         self.canvas.create_line(*tuple(int(x) for x in bbox), width=width)
