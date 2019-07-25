@@ -56,6 +56,7 @@ route_self_keys = ['opt',
                    'complex',
                    'fmm',
                    'genchk',
+                   'nosymm',
                    'polar',
                    'prop',
                    'pseudo',
@@ -194,8 +195,18 @@ class Gaussian(FileIOCalculator):
         inputfile = open(filename, 'w')
 
         link0 = str()
-        route = '#p %s/%s' % (self.parameters['method'],
-                              self.parameters['basis'])
+        if self.parameters['basis'] != '':
+            route = '#p %s/%s' % (self.parameters['method'],
+                                  self.parameters['basis'])
+        else:
+            route = '#p %s' % (self.parameters['method'])
+
+        # force is a default but is not compatible with freq
+        # remove force if freq or opt is specified
+        if ('freq' in self.parameters or 'opt' in self.parameters
+                or 'irc' in self.parameters):
+            if hasattr(self.parameters,'force'):
+                del self.parameters['force']
 
         for key, val in self.parameters.items():
             if key.lower() in link0_keys:
@@ -210,7 +221,13 @@ class Gaussian(FileIOCalculator):
                         route += ' %s=%s' % (key, val)
 
             elif key.lower() in route_keys:
-                route += ' %s=%s' % (key, val)
+                if (val.lower() == key.lower()):
+                    route += (' ' + val)
+                else:
+                    if ',' in val:
+                        route += ' %s(%s)' % (key, val)
+                    else:
+                        route += ' %s=%s' % (key, val)
 
         # include any other keyword(s)
         if self.extra is not None:
@@ -224,19 +241,42 @@ class Gaussian(FileIOCalculator):
         inputfile.write(link0)
         inputfile.write(route)
         inputfile.write(' \n\n')
-        inputfile.write('Gaussian input prepared by ASE\n\n')
-        inputfile.write('%i %i\n' % (self.parameters['charge'],
-                                     mult))
 
-        symbols = atoms.get_chemical_symbols()
-        coordinates = atoms.get_positions()
-        for i in range(len(atoms)):
-            inputfile.write('%-10s' % symbols[i])
-            for j in range(3):
-                inputfile.write('%20.10f' % coordinates[i, j])
+        write_geom = 1
+        if 'geom' in self.parameters:
+            if 'allcheck' in self.parameters['geom'].lower():
+                # do not write the geometry
+                write_geom = 0
+
+        if write_geom:
+            inputfile.write('Gaussian input prepared by ASE\n\n')
+            inputfile.write('%i %i\n' % (self.parameters['charge'],
+                                         mult))
+
+            symbols = atoms.get_chemical_symbols()
+            coordinates = atoms.get_positions()
+            for i in range(len(atoms)):
+                inputfile.write('%-10s' % symbols[i])
+                for j in range(3):
+                    inputfile.write('%20.10f' % coordinates[i, j])
+                inputfile.write('\n')
+
             inputfile.write('\n')
 
-        inputfile.write('\n')
+        if 'opt' in self.parameters:
+            if 'modredun' in [par.lower() for par in self.parameters['opt'].split(',')]:
+                if 'release' in self.parameters: #coordinates that first need to be unfrozen
+                    for r in self.parameters['release']:
+                        inputfile.write('%s A\n'%' '.join(map(str,r)))
+                if 'fix' in self.parameters: #coordinates that need to be frozen
+                    for fi in self.parameters['fix']:
+                        inputfile.write('%s F\n'%' '.join(map(str,fi)))
+                if 'change' in self.parameters: #coordinates that first need to be updated and then frozen
+                    for c in self.parameters['change']:
+                        inputfile.write('%s F\n'%' '.join(map(str,c)))
+                if 'relaxed_scan' in self.parameters: #coordinates that first need to be scanned
+                    for s in self.parameters['relaxed_scan']:
+                        inputfile.write('%s S %i %.2f\n'%(' '.join(map(str,s[:-2])),s[-2],s[-1]))
 
         if 'gen' in self.parameters['basis'].lower():
             if self.basisfile is None:
@@ -288,7 +328,7 @@ class Gaussian(FileIOCalculator):
 
         filename = self.label + '.log'
 
-        quantities = ['energy', 'forces', 'dipole']
+        quantities = ['energy', 'forces', 'dipole', 'positions']
         with open(filename, 'r') as fileobj:
             for quant in quantities:
                 self.results[quant] = read_gaussian_out(fileobj,
@@ -297,6 +337,20 @@ class Gaussian(FileIOCalculator):
             self.results['magmom'] = read_gaussian_out(fileobj,
                                                        quantity='multiplicity')
             self.results['magmom'] -= 1
+
+    def get_potential_energy(self, atoms):
+        """
+        Calculate and return potential energy
+        Update the geometry of the atoms
+        """
+        self.calculate(atoms)
+        energy = self.results['energy']
+        j = 0
+        for i,atom in enumerate(atoms):
+            if atom.symbol != 'X':
+                atoms.positions[i] = self.results['positions'][j]
+                j += 1
+        return energy
 
     def clean(self):
         """Cleans up from a previous run"""
