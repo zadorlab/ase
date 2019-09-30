@@ -36,7 +36,8 @@ allowed_dft_functionals = ['lsda',  # = 'svwn'
                            'm062x',
                            'tpssh',
                            'tpsstpss',
-                           'wb97xd']
+                           'wb97xd',
+                           'am1']
 
 
 def read_gaussian_out(filename, index=-1, quantity='atoms'):
