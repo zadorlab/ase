@@ -34,7 +34,8 @@ allowed_dft_functionals = ['lsda',  # = 'svwn'
                            'm062x',
                            'tpssh',
                            'tpsstpss',
-                           'wb97xd']
+                           'wb97xd',
+                           'am1']
 
 
 def read_gaussian_out(filename, index=-1, quantity='atoms'):
@@ -122,6 +123,9 @@ def read_gaussian_out(filename, index=-1, quantity='atoms'):
         forces = np.array(iforces) * convert
     except:
         forces = None
+    finally:
+        if isinstance(filename, basestring):
+            fileobj.close()
 
     energy *= ase.units.Hartree  # Convert the energy from a.u. to eV
     calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
